@@ -1,4 +1,4 @@
-# Notizen – selbst gehosteter Notizdienst im Stil von Google Notizen
+# Notizen - selbst gehosteter Notizdienst im Material 3 Stil
 
 Kachel-Layout mit Animationen, farbige Notizen, Checklisten, Formatierung, Bilder, Anheften, Labels,
 Archiv, Papierkorb, Mehrfachauswahl, Suche nach Typen/Labels/Dingen/Farben, frei belegbare
@@ -73,7 +73,7 @@ nächste/vorige Notiz, `Umschalt+J/K` verschieben, `Enter` öffnen, `X` auswähl
 Clients senden nie ganze Notizen, sondern nur **Befehle** – „füge an Position 12 ‚Hallo‘ ein“,
 „lösche 3 Zeichen“, „formatiere fett“, „lege Listenelement an“, „hake Element ab“ (`ot.py`,
 `static/js/delta.js`). Der Server vergibt fortlaufende Revisionen und transformiert gleichzeitige
-Befehle gegeneinander (Operational Transformation, Prinzip von Google Docs). Dadurch landen alle
+Befehle gegeneinander (Operational Transformation). Dadurch landen alle
 Teilnehmer garantiert beim identischen Ergebnis, ohne Sperren und ohne Mergekonflikte.
 Verbindungsabbrüche werden abgefangen: Änderungen bleiben im Browser vorgemerkt und werden nach
 der Wiederverbindung nachgereicht. `python tests/test_ot.py` prüft die Konvergenz mit 5000
