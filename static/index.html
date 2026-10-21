@@ -2,13 +2,16 @@
 <html lang="de">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#ffffff">
   <title>Notizen</title>
   <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/app.js" defer></script>
+  <script type="module" src="/static/js/app.js"></script>
 </head>
 <body>
   <!-- Anmeldung -->
@@ -42,17 +45,19 @@
           <span id="brand-title">Notizen</span>
         </div>
       </div>
-      <div class="search" id="search">
+      <div class="search" id="search" role="search">
         <button class="icon-btn" id="search-icon" type="button" title="Suchen" aria-label="Suchen"></button>
-        <input id="search-input" type="search" placeholder="Suchen" autocomplete="off" aria-label="Notizen durchsuchen">
+        <span id="search-chip" class="search-chip hidden"></span>
+        <input id="search-input" type="search" placeholder="Suchen" autocomplete="off" aria-label="Notizen durchsuchen" enterkeyhint="search">
         <button class="icon-btn hidden" id="search-clear" type="button" title="Suche löschen" aria-label="Suche löschen"></button>
       </div>
       <div class="topbar-right">
         <button id="refresh-btn" class="icon-btn" type="button" title="Aktualisieren" aria-label="Aktualisieren"></button>
         <button id="layout-btn" class="icon-btn" type="button"></button>
-        <button id="theme-btn" class="icon-btn" type="button"></button>
-        <button id="account-btn" class="avatar" type="button" aria-label="Konto"></button>
+        <button id="settings-btn" class="icon-btn" type="button" title="Einstellungen" aria-label="Einstellungen"></button>
+        <button id="account-btn" class="account-btn" type="button" aria-label="Konto"></button>
       </div>
+      <div id="selbar" class="selbar" role="toolbar" aria-label="Auswahl"></div>
     </header>
 
     <nav id="sidebar" class="sidebar" aria-label="Navigation"></nav>
