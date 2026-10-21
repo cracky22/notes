@@ -80,7 +80,10 @@ def open_db(must_exist: bool = True) -> sqlite3.Connection:
         die(f"Datenbank {core.DB_PATH} existiert nicht. Zuerst 'python admin.py init' ausführen.")
     core.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = core.connect()
-    core.init_db(conn)
+    try:
+        core.prepare_db(conn)
+    except core.CryptoError as exc:
+        die(f"Datenbank kann nicht aktualisiert werden: {exc}")
     return conn
 
 
@@ -146,7 +149,7 @@ def cmd_init(args) -> None:
         info(f"Neuer AES-256-Master-Schlüssel erzeugt: {core.KEY_PATH} (ID {kid})")
         info("WICHTIG: Diese Datei getrennt von der Datenbank sichern – ohne sie sind alle Notizen unlesbar!")
     open_db(must_exist=False).close()
-    info(f"Datenbank bereit: {core.DB_PATH}")
+    info(f"Datenbank bereit: {core.DB_PATH} (Schema v{core.SCHEMA_VERSION})")
     info("Nächster Schritt: python admin.py user add <benutzername>")
 
 
@@ -173,16 +176,19 @@ def cmd_user_list(args) -> None:
     conn = open_db()
     rows = conn.execute(
         "SELECT u.id, u.username, u.created_at, u.password_changed_at, "
-        "(SELECT COUNT(*) FROM notes n WHERE n.user_id = u.id) AS notes, "
+        "(SELECT COUNT(*) FROM notes n WHERE n.owner_id = u.id) AS notes, "
+        "(SELECT COUNT(*) FROM note_users nu WHERE nu.user_id = u.id AND nu.role = 'editor') AS shared, "
+        "(u.avatar_id IS NOT NULL) AS avatar, "
         "(SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > ?) AS sessions "
         "FROM users u ORDER BY u.username COLLATE NOCASE", (core.now(),)).fetchall()
     if not rows:
         info("Keine Benutzer vorhanden.")
         return
-    info(f"{'ID':>4}  {'Benutzer':<24} {'Notizen':>7} {'Sitzungen':>9}  {'Angelegt':<16}  Passwort geändert")
+    info(f"{'ID':>4}  {'Benutzer':<24} {'Notizen':>7} {'Geteilt':>7} {'Sitzungen':>9} {'Bild':>4}  "
+         f"{'Angelegt':<16}  Passwort geändert")
     for r in rows:
-        info(f"{r['id']:>4}  {r['username']:<24} {r['notes']:>7} {r['sessions']:>9}  "
-             f"{fmt_ts(r['created_at']):<16}  {fmt_ts(r['password_changed_at'])}")
+        info(f"{r['id']:>4}  {r['username']:<24} {r['notes']:>7} {r['shared']:>7} {r['sessions']:>9} "
+             f"{'ja' if r['avatar'] else '–':>4}  {fmt_ts(r['created_at']):<16}  {fmt_ts(r['password_changed_at'])}")
 
 
 def cmd_user_passwd(args) -> None:
@@ -199,10 +205,12 @@ def cmd_user_passwd(args) -> None:
 def cmd_user_delete(args) -> None:
     conn = open_db()
     user = get_user(conn, args.username)
-    n = conn.execute("SELECT COUNT(*) FROM notes WHERE user_id = ?", (user["id"],)).fetchone()[0]
-    if not confirm(f"Benutzer '{user['username']}' mit {n} Notizen endgültig löschen?", args.yes):
+    n = conn.execute("SELECT COUNT(*) FROM notes WHERE owner_id = ?", (user["id"],)).fetchone()[0]
+    if not confirm(f"Benutzer '{user['username']}' mit {n} eigenen Notizen endgültig löschen? "
+                   "(Auch für Mitbearbeiter geteilte Notizen dieses Benutzers werden gelöscht.)", args.yes):
         info("Abgebrochen.")
         return
+    conn.execute("DELETE FROM blobs WHERE kind = 'avatar' AND owner_id = ?", (user["id"],))
     conn.execute("DELETE FROM users WHERE id = ?", (user["id"],))
     conn.commit()
     conn.execute("VACUUM")
@@ -258,13 +266,7 @@ def cmd_key_rotate(args) -> None:
     changed = 0
     try:
         conn.execute("BEGIN IMMEDIATE")
-        for table, col in core.ENCRYPTED_COLUMNS:
-            for rid, value in conn.execute(f"SELECT id, {col} FROM {table}").fetchall():
-                if value.startswith(new_kid + ":"):
-                    continue
-                conn.execute(f"UPDATE {table} SET {col} = ? WHERE id = ?",
-                             (ring.encrypt(ring.decrypt(value)), rid))
-                changed += 1
+        changed = core.reencrypt_all(conn, ring, new_kid)
         conn.commit()
     except Exception as exc:  # noqa: BLE001
         conn.rollback()
