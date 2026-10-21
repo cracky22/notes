@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff">
+  <title>Notizen</title>
+  <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <!-- Anmeldung -->
+  <div id="login" class="login hidden">
+    <form id="login-form" class="login-card" autocomplete="on" novalidate>
+      <img src="/static/logo.svg" alt="" width="56" height="56">
+      <h1>Anmelden</h1>
+      <p class="login-sub">Weiter zu Notizen</p>
+      <label class="field">
+        <span>Benutzername</span>
+        <input id="login-user" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="64">
+      </label>
+      <label class="field">
+        <span>Passwort</span>
+        <input id="login-pass" name="password" type="password" autocomplete="current-password" required maxlength="1024">
+      </label>
+      <div id="login-error" class="form-error" role="alert"></div>
+      <div class="login-actions">
+        <button type="submit" class="btn-primary" id="login-submit">Anmelden</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Anwendung -->
+  <div id="app" class="hidden">
+    <header class="topbar" id="topbar">
+      <div class="topbar-left">
+        <button id="menu-btn" class="icon-btn" type="button" title="Hauptmenü" aria-label="Hauptmenü"></button>
+        <div class="brand">
+          <img id="brand-logo" src="/static/logo.svg" alt="" width="40" height="40">
+          <span id="brand-title">Notizen</span>
+        </div>
+      </div>
+      <div class="search" id="search">
+        <button class="icon-btn" id="search-icon" type="button" title="Suchen" aria-label="Suchen"></button>
+        <input id="search-input" type="search" placeholder="Suchen" autocomplete="off" aria-label="Notizen durchsuchen">
+        <button class="icon-btn hidden" id="search-clear" type="button" title="Suche löschen" aria-label="Suche löschen"></button>
+      </div>
+      <div class="topbar-right">
+        <button id="refresh-btn" class="icon-btn" type="button" title="Aktualisieren" aria-label="Aktualisieren"></button>
+        <button id="layout-btn" class="icon-btn" type="button"></button>
+        <button id="theme-btn" class="icon-btn" type="button"></button>
+        <button id="account-btn" class="avatar" type="button" aria-label="Konto"></button>
+      </div>
+    </header>
+
+    <nav id="sidebar" class="sidebar" aria-label="Navigation"></nav>
+    <div id="sidebar-scrim" class="scrim"></div>
+
+    <main id="main" class="main">
+      <div id="composer-wrap" class="composer-wrap"></div>
+      <div id="notice"></div>
+      <div id="notes-area"></div>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="popover" class="popover hidden"></div>
+  <div id="snackbar" class="snackbar" role="status" aria-live="polite"></div>
+</body>
+</html>
