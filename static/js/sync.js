@@ -37,8 +37,11 @@ export class Connection {
 
   connect() {
     this.stopped = false;
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws?client=${this.clientId}`);
+    // relativ zur aktuellen Seite (funktioniert auch hinter einem Reverse-Proxy unter /notes/)
+    const url = new URL('ws', location.href);
+    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.search = `?client=${this.clientId}`;
+    const ws = new WebSocket(url);
     this.ws = ws;
     ws.onopen = () => {
       this.online = true;

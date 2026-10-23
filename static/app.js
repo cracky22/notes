@@ -1,1415 +1,1320 @@
-/* Notizen – Frontend (Vanilla JS, keine externen Abhängigkeiten) */
-'use strict';
+/* app.js – Hauptanwendung: Laden, Raster, Suche, Auswahl, Tastenkürzel, Echtzeit-Updates */
+import { renderHTML } from './editor.js';
+import { Connection, NoteState, rid } from './sync.js';
+import { NoteEditor } from './noteeditor.js';
+import * as D from './dialogs.js';
+import {
+  $, h, icon, iconBtn, setIcon, avatar, openModal, modals, openPopover, closePopover, popoverOwner, menu, toast, hideToast,
+  confirmDialog, captureLayout, playLayout, debounce, plural, pickFiles, shrinkImage, animate,
+} from './dom.js';
+import {
+  state, app, store, api, AuthError, setting, updateSettings, keymap, comboFromEvent, SHORTCUT_SCOPE, hintFor,
+} from './state.js';
 
-(() => {
-  // ======================================================================
-  // Icons (Pfade aus Material Icons, Apache-2.0-Lizenz)
-  // ======================================================================
-  const ICONS = {
-    menu: 'M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z',
-    search: 'M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z',
-    close: 'M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z',
-    refresh: 'M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z',
-    view_agenda: 'M20 13H3c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h17c.55 0 1-.45 1-1v-6c0-.55-.45-1-1-1zm0-10H3c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h17c.55 0 1-.45 1-1V4c0-.55-.45-1-1-1z',
-    grid_view: 'M3 3v8h8V3H3zm6 6H5V5h4v4zm-6 4v8h8v-8H3zm6 6H5v-4h4v4zm4-16v8h8V3h-8zm6 6h-4V5h4v4zm-6 4v8h8v-8h-8zm6 6h-4v-4h4v4z',
-    lightbulb: 'M9 21c0 .55.45 1 1 1h4c.55 0 1-.45 1-1v-1H9v1zm3-19C8.14 2 5 5.14 5 9c0 2.38 1.19 4.47 3 5.74V17c0 .55.45 1 1 1h6c.55 0 1-.45 1-1v-2.26c1.81-1.27 3-3.36 3-5.74 0-3.86-3.14-7-7-7zm2.85 11.1-.85.6V16h-4v-2.3l-.85-.6A4.997 4.997 0 0 1 7 9c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.63-.8 3.16-2.15 4.1z',
-    label: 'M17.63 5.84C17.27 5.33 16.67 5 16 5L5 5.01C3.9 5.01 3 5.9 3 7v10c0 1.1.9 1.99 2 1.99L16 19c.67 0 1.27-.33 1.63-.84L22 12l-4.37-6.16zM16 17H5V7h11l3.55 5L16 17z',
-    edit: 'M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a.996.996 0 0 0 0-1.41l-2.34-2.34a.996.996 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z',
-    archive: 'M20.54 5.23l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.16.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5 6.5 12H10v-2h4v2h3.5L12 17.5zM5.12 5l.81-1h12l.94 1H5.12z',
-    unarchive: 'M20.55 5.22l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.15.55L3.46 5.22C3.17 5.57 3 6.01 3 6.5V19c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.49-.17-.93-.45-1.28zM12 9.5l5.5 5.5H14v2h-4v-2H6.5L12 9.5zM5.12 5l.82-1h12l.93 1H5.12z',
-    delete: 'M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z',
-    delete_forever: 'M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zm2.46-7.12 1.41-1.41L12 12.59l2.12-2.12 1.41 1.41L13.41 14l2.12 2.12-1.41 1.41L12 15.41l-2.12 2.12-1.41-1.41L10.59 14l-2.13-2.12zM15.5 4l-1-1h-5l-1 1H5v2h14V4z',
-    restore_from_trash: 'M19 4h-3.5l-1-1h-5l-1 1H5v2h14zM6 7v12c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6zm8 7v4h-4v-4H8l4-4 4 4h-2z',
-    palette: 'M12 3a9 9 0 0 0 0 18c.83 0 1.5-.67 1.5-1.5 0-.39-.15-.74-.39-1.01-.23-.26-.38-.61-.38-.99 0-.83.67-1.5 1.5-1.5H16c2.76 0 5-2.24 5-5 0-4.42-4.03-8-9-8zm-5.5 9c-.83 0-1.5-.67-1.5-1.5S5.67 9 6.5 9 8 9.67 8 10.5 7.33 12 6.5 12zm3-4C8.67 8 8 7.33 8 6.5S8.67 5 9.5 5s1.5.67 1.5 1.5S10.33 8 9.5 8zm5 0c-.83 0-1.5-.67-1.5-1.5S13.67 5 14.5 5s1.5.67 1.5 1.5S15.33 8 14.5 8zm3 4c-.83 0-1.5-.67-1.5-1.5S16.67 9 17.5 9s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z',
-    more_vert: 'M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z',
-    push_pin: 'M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z',
-    push_pin_outline: 'M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z',
-    check_box: 'M19 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.11 0 2-.9 2-2V5c0-1.1-.89-2-2-2zm-9 14-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z',
-    check_box_outline_blank: 'M19 5v14H5V5h14m0-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z',
-    check: 'M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z',
-    add: 'M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z',
-    expand_more: 'M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z',
-    format_color_reset: 'M18 14c0-4-6-10.8-6-10.8s-1.33 1.51-2.73 3.52l8.59 8.59c.09-.42.14-.86.14-1.31zm-.88 3.12L12.5 12.5 5.27 5.27 4 6.55l3.32 3.32C6.55 11.32 6 12.79 6 14c0 3.31 2.69 6 6 6 1.52 0 2.9-.57 3.96-1.5l2.63 2.63 1.27-1.27-2.74-2.74z',
-    dark_mode: 'M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z',
-    light_mode: 'M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58a.996.996 0 0 0-1.41 0 .996.996 0 0 0 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0s.39-1.03 0-1.41L5.99 4.58zm12.37 12.37a.996.996 0 0 0-1.41 0 .996.996 0 0 0 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0a.996.996 0 0 0 0-1.41l-1.06-1.06zm1.06-10.96a.996.996 0 0 0 0-1.41.996.996 0 0 0-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41s1.03.39 1.41 0l1.06-1.06zM7.05 18.36a.996.996 0 0 0 0-1.41.996.996 0 0 0-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41s1.03.39 1.41 0l1.06-1.06z',
-    brightness_auto: 'M10.85 12.65h2.3L12 9l-1.15 3.65zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12 20 8.69zM14.3 16l-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9h-1.9z',
-  };
+const META_KEYS = ['color', 'images', 'members', 'owner_id', 'role', 'pinned', 'archived', 'position', 'trashed',
+  'trashed_at', 'labels', 'created_at', 'updated_at', 'updated_by'];
+const THEMES = { system: ['brightness_auto', 'Design: wie System'], light: ['light_mode', 'Design: hell'], dark: ['dark_mode', 'Design: dunkel'] };
+const URL_RE = /\bhttps?:\/\/\S+/i;
+const isTouch = () => window.matchMedia('(pointer: coarse)').matches;
+const isNarrow = () => window.matchMedia('(max-width: 720px)').matches;
 
-  const COLORS = [
-    ['default', 'Standard'], ['red', 'Koralle'], ['orange', 'Pfirsich'], ['yellow', 'Sand'],
-    ['green', 'Minze'], ['teal', 'Salbei'], ['blue', 'Nebel'], ['darkblue', 'Sturm'],
-    ['purple', 'Lavendel'], ['pink', 'Blüte'], ['brown', 'Lehm'], ['gray', 'Kreide'],
-  ];
-  const THEMES = {
-    system: ['brightness_auto', 'Design: wie System'],
-    light: ['light_mode', 'Design: hell'],
-    dark: ['dark_mode', 'Design: dunkel'],
-  };
-  const CARD_W = 240;
-  const GAP = 16;
+let conn = null;
+let ready = false;
+let queue = [];
+let editor = null;          // {ed, note, modal}
+const composer = { expanded: false, ed: null, ns: null, meta: null };
 
-  // ======================================================================
-  // Hilfsfunktionen
-  // ======================================================================
-  const $ = (sel, root = document) => root.querySelector(sel);
-  const SVG_NS = 'http://www.w3.org/2000/svg';
+// ===========================================================================
+// Kategorien für die Suche (wie „Typen“, „Dinge“, „Farben“ im Original)
+// ===========================================================================
+const TYPES = [
+  ['list', 'Listen', 'check_box', n => n.ns.doc.is_list],
+  ['image', 'Bilder', 'image_o', n => n.images.length > 0],
+  ['url', 'Links', 'link', n => URL_RE.test(noteText(n))],
+  ['shared', 'Geteilt', 'group', n => n.members.length > 1],
+];
+const THINGS = [
+  ['books', 'Bücher', 'book', ['buch', 'bücher', 'roman', 'autor', 'lesen', 'lektüre', 'hörbuch', 'isbn', 'book', 'novel', 'author', 'bestseller']],
+  ['food', 'Essen', 'restaurant', ['rezept', 'kochen', 'backen', 'zutat', 'essen', 'mehl', 'zucker', 'butter', 'pizza', 'pasta', 'nudel', 'salat', 'suppe', 'kuchen', 'frühstück', 'abendessen', 'mittagessen', 'restaurant', 'recipe', 'dinner', 'lunch', 'gemüse', 'käse']],
+  ['places', 'Orte', 'place', ['adresse', 'straße', 'museum', 'park', 'café', 'cafe', 'hotel', 'strand', 'stadt', 'address', 'street', 'platz']],
+  ['movies', 'Filme', 'movie', ['film', 'kino', 'movie', 'regie', 'trailer', 'netflix']],
+  ['music', 'Musik', 'music', ['musik', 'song', 'lied', 'album', 'band', 'konzert', 'playlist', 'spotify', 'music']],
+  ['tv', 'Serien', 'tv', ['serie', 'staffel', 'episode', 'fernseh', 'season', 'tv-']],
+  ['travel', 'Reisen', 'flight', ['reise', 'urlaub', 'flug', 'flughafen', 'zug', 'bahn', 'koffer', 'packliste', 'visum', 'trip', 'travel', 'flight', 'vacation']],
+  ['shopping', 'Einkaufen', 'cart', ['einkauf', 'kaufen', 'supermarkt', 'drogerie', 'bestellen', 'shopping', 'grocer']],
+  ['work', 'Arbeit', 'work', ['projekt', 'meeting', 'besprechung', 'kunde', 'angebot', 'rechnung', 'deadline', 'präsentation', 'büro', 'office', 'team']],
+  ['sport', 'Sport', 'sport', ['sport', 'training', 'laufen', 'joggen', 'fitness', 'yoga', 'fußball', 'radfahren', 'schwimmen', 'workout', 'gym']],
+  ['quotes', 'Zitate', 'quote', ['zitat', 'quote']],
+];
 
-  function icon(name, size = 24) {
-    const svg = document.createElementNS(SVG_NS, 'svg');
-    svg.setAttribute('viewBox', '0 0 24 24');
-    svg.setAttribute('width', size);
-    svg.setAttribute('height', size);
-    svg.setAttribute('aria-hidden', 'true');
-    svg.setAttribute('class', 'icon');
-    const path = document.createElementNS(SVG_NS, 'path');
-    path.setAttribute('d', ICONS[name] || '');
-    svg.append(path);
-    return svg;
-  }
+function noteText(n) {
+  const d = n.ns.doc;
+  return [d.title, d.is_list ? d.items.map(i => i.text).join('\n') : d.body.text()].join('\n');
+}
+function noteWords(n) {
+  if (n._wordsRev === n.ns.rev && n._words && !n.ns.pending()) return n._words;
+  n._words = noteText(n).toLocaleLowerCase().split(/[^\p{L}\p{N}-]+/u).filter(Boolean);
+  n._wordsRev = n.ns.rev;
+  return n._words;
+}
+function isThing(n, thing) {
+  const kws = thing[3];
+  if (thing[0] === 'quotes' && /[„“"»«][^„“"»«]{8,}[“"«»]/.test(noteText(n))) return true;
+  return noteWords(n).some(w => kws.some(k => w.startsWith(k)));
+}
+function matchesFilter(n, f) {
+  if (!f) return true;
+  if (f.kind === 'type') return TYPES.find(t => t[0] === f.value)[3](n);
+  if (f.kind === 'label') return n.labels.includes(f.value);
+  if (f.kind === 'color') return n.color === f.value;
+  if (f.kind === 'thing') return isThing(n, THINGS.find(t => t[0] === f.value));
+  return true;
+}
+function haystack(n) {
+  const labels = n.labels.map(id => (state.labels.find(l => l.id === id) || {}).name || '');
+  const people = n.members.map(m => m.username);
+  return [noteText(n), ...labels, ...people].join('\n').toLocaleLowerCase();
+}
 
-  /** Erzeugt DOM-Elemente. Nutzertext immer über textContent (kein innerHTML → kein XSS). */
-  function h(tag, attrs = {}, ...children) {
-    const el = document.createElement(tag);
-    for (const [k, v] of Object.entries(attrs || {})) {
-      if (v === null || v === undefined || v === false) continue;
-      if (k === 'class') el.className = v;
-      else if (k === 'text') el.textContent = v;
-      else if (k === 'dataset') Object.assign(el.dataset, v);
-      else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
-      else el.setAttribute(k, v === true ? '' : v);
+// ===========================================================================
+// Notizen verwalten
+// ===========================================================================
+function metaOf(view) {
+  const m = {};
+  for (const k of META_KEYS) if (k in view) m[k] = view[k];
+  return m;
+}
+
+function upsertNote(view) {
+  let n = state.notes.get(view.id);
+  if (!n) {
+    n = { id: view.id, ...metaOf(view) };
+    n.ns = new NoteState(conn, view);
+    n.ns.on(ev => { if (ev.type !== 'synced') noteChanged(n.id); if (ev.type === 'reset' && ev.lost) toast('Einige Änderungen konnten nicht synchronisiert werden.'); });
+    state.notes.set(n.id, n);
+  } else {
+    Object.assign(n, metaOf(view));
+    if (view.rev > n.ns.rev) {
+      if (!n.ns.pending()) n.ns.reset(view);
+      else n.ns.catchup();
     }
-    for (const c of children.flat()) {
-      if (c === null || c === undefined || c === false) continue;
-      el.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+  for (const m of n.members || []) if (!state.users.has(m.id)) state.users.set(m.id, { id: m.id, username: m.username, avatar: m.avatar });
+  if (editor && editor.note === n) {
+    editor.ed.refreshMeta();
+    if (n.trashed !== editor.ed.readOnly) closeEditor();
+  }
+  scheduleRender();
+  return n;
+}
+app.upsertNote = upsertNote;
+
+function removeNote(id, message) {
+  const n = state.notes.get(id);
+  if (!n) return;
+  state.notes.delete(id);
+  state.selected.delete(id);
+  if (editor && editor.note === n) {
+    editor.modal.close();
+    if (message) toast(message);
+  }
+  scheduleRender();
+}
+app.removeNote = removeNote;
+
+let dirtyCards = new Set();
+let cardFrame = null;
+function noteChanged(id) {
+  dirtyCards.add(id);
+  if (cardFrame) return;
+  cardFrame = requestAnimationFrame(() => {
+    cardFrame = null;
+    const ids = dirtyCards;
+    dirtyCards = new Set();
+    let relayout = false;
+    for (const nid of ids) {
+      const old = document.querySelector(`.note-card[data-key="${nid}"]`);
+      const n = state.notes.get(nid);
+      if (!old || !n) { relayout = true; continue; }
+      const fresh = buildCard(n, old._list);
+      fresh._list = old._list;
+      const hBefore = old.offsetHeight;
+      old.replaceWith(fresh);
+      if (fresh.offsetHeight !== hBefore) relayout = true;
     }
-    return el;
+    if (relayout) relayoutSoon();
+  });
+}
+app.noteChanged = noteChanged;
+const relayoutSoon = debounce(() => renderMain(), 350);
+
+let renderFrame = null;
+function scheduleRender() {
+  if (renderFrame) return;
+  renderFrame = requestAnimationFrame(() => { renderFrame = null; render(); });
+}
+
+// ===========================================================================
+// Aktionen
+// ===========================================================================
+function handleError(err) {
+  if (err instanceof AuthError) return;
+  console.error(err);
+  toast(err.message || 'Unbekannter Fehler');
+}
+app.handleError = handleError;
+
+async function patchNote(n, patch) {
+  Object.assign(n, patch);
+  if ('trashed' in patch) n.trashed_at = patch.trashed ? Date.now() / 1000 : null;
+  if (editor && editor.note === n) editor.ed.refreshMeta();
+  scheduleRender();
+  try {
+    const fresh = await api('PATCH', `api/notes/${n.id}`, patch);
+    Object.assign(n, metaOf(fresh));
+    if (editor && editor.note === n) editor.ed.refreshMeta();
+    scheduleRender();
+  } catch (e) {
+    handleError(e);
+    reloadAll();
   }
+}
 
-  function iconBtn(name, title, onclick, cls = '') {
-    return h('button', { type: 'button', class: `icon-btn ${cls}`.trim(), title, 'aria-label': title, onclick }, icon(name));
+const targets = n => (n ? [n] : selectedNotes());
+function selectedNotes() { return [...state.selected].map(id => state.notes.get(id)).filter(Boolean); }
+
+function actPin(list) {
+  const pin = list.some(n => !n.pinned || n.archived);
+  list.forEach(n => patchNote(n, pin ? { pinned: true, archived: false } : { pinned: false }));
+  if (list.length > 1) toast(pin ? `${plural(list.length, 'Notiz', 'Notizen')} angeheftet` : `${plural(list.length, 'Notiz', 'Notizen')} losgelöst`);
+}
+function actColor(list, color) { list.forEach(n => patchNote(n, { color })); }
+function actArchive(list) {
+  const archive = list.some(n => !n.archived);
+  const prev = list.map(n => ({ n, archived: n.archived, pinned: n.pinned }));
+  list.forEach(n => patchNote(n, { archived: archive, pinned: false }));
+  clearSelection();
+  const label = list.length > 1 ? `${plural(list.length, 'Notiz', 'Notizen')} ${archive ? 'archiviert' : 'wiederhergestellt'}`
+    : archive ? 'Notiz archiviert' : 'Archivierung der Notiz aufgehoben';
+  toast(label, 'Rückgängig', () => prev.forEach(p => patchNote(p.n, { archived: p.archived, pinned: p.pinned })));
+}
+async function actTrash(list) {
+  const own = list.filter(n => n.role === 'owner');
+  const shared = list.filter(n => n.role !== 'owner');
+  if (shared.length) {
+    const ok = await confirmDialog(shared.length === 1
+      ? 'Du bist Mitbearbeiter dieser Notiz. Möchtest du sie aus deinen Notizen entfernen? Für die anderen bleibt sie erhalten.'
+      : `${shared.length} geteilte Notizen aus deinen Notizen entfernen?`, 'Entfernen');
+    if (ok) for (const n of shared) { try { await api('POST', `api/notes/${n.id}/leave`); removeNote(n.id); } catch (e) { handleError(e); } }
   }
-
-  function setIcon(el, name) { el.replaceChildren(icon(name)); }
-
-  function uid() {
-    if (window.crypto && crypto.getRandomValues) {
-      return Array.from(crypto.getRandomValues(new Uint8Array(6)), b => b.toString(16).padStart(2, '0')).join('');
-    }
-    return Math.random().toString(16).slice(2, 14);
+  if (!own.length) { clearSelection(); return; }
+  if (own.some(n => n.members.length > 1)) {
+    if (!await confirmDialog('Diese Notiz ist geteilt. Wenn du sie löschst, wird sie auch für alle Mitbearbeiter gelöscht.', 'Löschen')) return;
   }
-
-  const store = {
-    get(key, fallback) {
-      try { const v = localStorage.getItem('notizen.' + key); return v === null ? fallback : v; } catch { return fallback; }
-    },
-    set(key, value) { try { localStorage.setItem('notizen.' + key, value); } catch { /* egal */ } },
-  };
-
-  function debounce(fn, ms) {
-    let t;
-    return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+  own.forEach(n => patchNote(n, { trashed: true }));
+  clearSelection();
+  toast(own.length > 1 ? `${plural(own.length, 'Notiz', 'Notizen')} in den Papierkorb verschoben` : 'Notiz in den Papierkorb verschoben',
+    'Rückgängig', () => own.forEach(n => patchNote(n, { trashed: false })));
+}
+function actRestore(list) {
+  list.forEach(n => patchNote(n, { trashed: false }));
+  clearSelection();
+  toast(list.length > 1 ? `${plural(list.length, 'Notiz', 'Notizen')} wiederhergestellt` : 'Notiz wiederhergestellt',
+    'Rückgängig', () => list.forEach(n => patchNote(n, { trashed: true })));
+}
+async function actDeleteForever(list) {
+  if (!await confirmDialog(list.length > 1 ? `${list.length} Notizen endgültig löschen?` : 'Notiz endgültig löschen?', 'Löschen')) return;
+  for (const n of list) {
+    try { await api('DELETE', `api/notes/${n.id}`); removeNote(n.id); } catch (e) { handleError(e); }
   }
-
-  function autoGrow(el) {
-    if (!el || !el.isConnected) return;
-    el.style.height = 'auto';
-    el.style.height = el.scrollHeight + 'px';
+  clearSelection();
+}
+async function actCopy(list) {
+  for (const n of list) {
+    try { upsertNote(await api('POST', `api/notes/${n.id}/copy`)); } catch (e) { handleError(e); }
   }
-
-  function fmtDate(ts) {
-    const d = new Date(ts * 1000);
-    const now = new Date();
-    const time = d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-    if (d.toDateString() === now.toDateString()) return time;
-    const yesterday = new Date(now);
-    yesterday.setDate(now.getDate() - 1);
-    if (d.toDateString() === yesterday.toDateString()) return `Gestern, ${time}`;
-    const opts = { day: 'numeric', month: 'short' };
-    if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
-    return d.toLocaleDateString('de-DE', opts);
-  }
-
-  const byName = (a, b) => a.name.localeCompare(b.name, 'de', { sensitivity: 'base' });
-  const sortedLabels = () => [...state.labels].sort(byName);
-  const isMobile = () => window.matchMedia('(max-width: 720px)').matches;
-  const findNote = id => state.notes.find(n => n.id === id);
-  const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-
-  function avatarColor(name) {
-    let hash = 0;
-    for (const ch of name) hash = (hash * 31 + ch.codePointAt(0)) >>> 0;
-    const palette = ['#1a73e8', '#d93025', '#188038', '#e37400', '#9334e6', '#007b83', '#c5221f', '#b06000'];
-    return palette[hash % palette.length];
-  }
-
-  // ======================================================================
-  // Zustand
-  // ======================================================================
-  const state = {
-    user: null,
-    notes: [],
-    labels: [],
-    view: 'notes',          // notes | archive | trash | label
-    labelId: null,
-    search: '',
-    layout: store.get('layout', 'grid') === 'list' ? 'list' : 'grid',
-    theme: THEMES[store.get('theme', 'system')] ? store.get('theme', 'system') : 'system',
-    navCollapsed: store.get('nav', '0') === '1',
-  };
-  let editor = null;          // { note } während eine Notiz im Modal bearbeitet wird
-  let loginShown = false;
-
-  // ======================================================================
-  // API
-  // ======================================================================
-  class AuthError extends Error {}
-
-  async function api(method, url, body, { auth = true } = {}) {
-    const opts = { method, headers: { 'X-Requested-With': 'notizen' }, credentials: 'same-origin' };
-    if (body !== undefined) {
-      opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(body);
-    }
-    let res;
-    try { res = await fetch(url, opts); } catch { throw new Error('Keine Verbindung zum Server'); }
-    if (res.status === 401 && auth) {
-      showLogin();
-      throw new AuthError('Nicht angemeldet');
-    }
-    if (!res.ok) {
-      let msg = `Fehler ${res.status}`;
-      try {
-        const data = await res.json();
-        if (typeof data.detail === 'string') msg = data.detail;
-        else if (Array.isArray(data.detail)) msg = 'Ungültige Eingabe';
-      } catch { /* kein JSON */ }
-      const err = new Error(msg);
-      err.status = res.status;
-      throw err;
-    }
-    return res.status === 204 ? null : res.json();
-  }
-
-  function handleError(err) {
-    if (err instanceof AuthError) return;
-    console.error(err);
-    toast(err.message || 'Unbekannter Fehler');
-  }
-
-  // ======================================================================
-  // Design (hell/dunkel)
-  // ======================================================================
-  const darkMq = window.matchMedia('(prefers-color-scheme: dark)');
-
-  function applyTheme() {
-    const theme = state.theme === 'system' ? (darkMq.matches ? 'dark' : 'light') : state.theme;
-    document.documentElement.dataset.theme = theme;
-    $('meta[name="theme-color"]').setAttribute('content', theme === 'dark' ? '#202124' : '#ffffff');
-    const btn = $('#theme-btn');
-    const [ic, label] = THEMES[state.theme];
-    setIcon(btn, ic);
-    btn.title = label;
-    btn.setAttribute('aria-label', label);
-  }
-
-  function cycleTheme() {
-    const order = ['system', 'light', 'dark'];
-    state.theme = order[(order.indexOf(state.theme) + 1) % order.length];
-    store.set('theme', state.theme);
-    applyTheme();
-    toast(THEMES[state.theme][1]);
-  }
-
-  // ======================================================================
-  // Modale Dialoge, Popover, Snackbar
-  // ======================================================================
-  const modals = [];
-
-  function openModal(content, { onClose, className = '' } = {}) {
-    const box = h('div', { class: `modal ${className}`.trim(), role: 'dialog', 'aria-modal': 'true' }, content);
-    const backdrop = h('div', { class: 'modal-backdrop' }, box);
-    const entry = { backdrop, box, onClose, close: () => closeModal(entry) };
-    backdrop.addEventListener('mousedown', e => { if (e.target === backdrop) entry.close(); });
-    $('#modal-root').append(backdrop);
-    requestAnimationFrame(() => backdrop.classList.add('open'));
-    modals.push(entry);
-    document.body.classList.add('modal-open');
-    return entry;
-  }
-
-  function closeModal(entry) {
-    const i = modals.indexOf(entry);
-    if (i < 0) return;
-    modals.splice(i, 1);
-    closePopover();
-    entry.backdrop.remove();
-    if (!modals.length) document.body.classList.remove('modal-open');
-    if (entry.onClose) entry.onClose();
-  }
-
-  let popOwner = null;
-
-  function openPopover(anchor, content) {
-    const pop = $('#popover');
-    if (popOwner === anchor) { closePopover(); return; }
-    closePopover();
-    pop.replaceChildren(content);
-    pop.classList.remove('hidden');
-    pop.style.left = '0px';
-    pop.style.top = '0px';
-    popOwner = anchor;
-    anchor.classList.add('active');
-    const r = anchor.getBoundingClientRect();
-    const pw = pop.offsetWidth;
-    const ph = pop.offsetHeight;
-    let left = r.left;
-    let top = r.bottom + 4;
-    if (left + pw > window.innerWidth - 8) left = Math.max(8, window.innerWidth - pw - 8);
-    if (top + ph > window.innerHeight - 8) top = Math.max(8, r.top - ph - 4);
-    pop.style.left = `${left}px`;
-    pop.style.top = `${top}px`;
-  }
-
-  function closePopover() {
-    if (!popOwner) return;
-    const pop = $('#popover');
-    pop.classList.add('hidden');
-    pop.replaceChildren();
-    popOwner.classList.remove('active');
-    popOwner = null;
-  }
-
-  function menuPopover(items) {
-    return h('div', { class: 'menu', role: 'menu' }, items.map(it =>
-      h('button', { type: 'button', class: 'menu-item', role: 'menuitem', onclick: () => { closePopover(); it.action(); } }, it.label)));
-  }
-
-  let snackTimer = null;
-
-  function toast(text, actionLabel, action) {
-    const sb = $('#snackbar');
-    sb.replaceChildren(h('span', { class: 'snack-text', text }));
-    if (action) sb.append(h('button', { type: 'button', class: 'snack-action', onclick: () => { hideSnack(); action(); } }, actionLabel));
-    sb.append(iconBtn('close', 'Schließen', hideSnack));
-    sb.classList.add('show');
-    clearTimeout(snackTimer);
-    snackTimer = setTimeout(hideSnack, 6000);
-  }
-
-  function hideSnack() {
-    clearTimeout(snackTimer);
-    $('#snackbar').classList.remove('show');
-  }
-
-  function confirmDialog(text, okLabel = 'OK') {
-    return new Promise(resolve => {
-      let result = false;
-      const ok = h('button', { type: 'button', class: 'text-btn primary', onclick: () => { result = true; m.close(); } }, okLabel);
-      const content = h('div', { class: 'dialog' },
-        h('p', { class: 'dialog-text', text }),
-        h('div', { class: 'dialog-actions' },
-          h('button', { type: 'button', class: 'text-btn', onclick: () => m.close() }, 'Abbrechen'), ok));
-      const m = openModal(content, { className: 'small', onClose: () => resolve(result) });
-      ok.focus();
-    });
-  }
-
-  // ======================================================================
-  // Popover-Inhalte: Farbpalette und Label-Auswahl
-  // ======================================================================
-  function palettePopover(current, onPick) {
-    const wrap = h('div', { class: 'palette', role: 'menu', 'aria-label': 'Hintergrundfarbe' });
-    for (const [color, name] of COLORS) {
-      const btn = h('button', {
-        type: 'button', class: 'swatch' + (color === current ? ' selected' : ''), dataset: { color },
-        title: name, 'aria-label': name, onclick: () => { closePopover(); onPick(color); },
-      });
-      if (color === 'default') btn.append(icon('format_color_reset', 18));
-      if (color === current) btn.append(h('span', { class: 'swatch-check' }, icon('check', 14)));
-      wrap.append(btn);
-    }
-    return wrap;
-  }
-
-  function labelPopover(getIds, setIds) {
-    const input = h('input', { type: 'text', placeholder: 'Labelnamen eingeben', maxlength: '100', 'aria-label': 'Label suchen oder erstellen' });
-    const list = h('div', { class: 'label-picker-list' });
-    const draw = () => {
-      const q = input.value.trim();
-      const ql = q.toLocaleLowerCase();
-      const ids = getIds();
-      list.replaceChildren();
-      for (const lab of sortedLabels()) {
-        if (ql && !lab.name.toLocaleLowerCase().includes(ql)) continue;
-        const checked = ids.includes(lab.id);
-        list.append(h('button', {
-          type: 'button', class: 'check-row', role: 'menuitemcheckbox', 'aria-checked': String(checked),
-          onclick: () => {
-            const cur = getIds();
-            setIds(checked ? cur.filter(x => x !== lab.id) : [...cur, lab.id]);
-            draw();
-          },
-        }, icon(checked ? 'check_box' : 'check_box_outline_blank', 18), h('span', { text: lab.name })));
-      }
-      if (q && !state.labels.some(l => l.name.toLocaleLowerCase() === ql)) {
-        list.append(h('button', {
-          type: 'button', class: 'create-row',
-          onclick: async () => {
-            try {
-              const lab = await createLabel(q);
-              setIds([...getIds(), lab.id]);
-              input.value = '';
-              draw();
-            } catch (e) { handleError(e); }
-          },
-        }, icon('add', 18), h('span', {}, 'Erstellen: ', h('strong', { text: `„${q}“` }))));
-      }
-    };
-    input.addEventListener('input', draw);
-    input.addEventListener('keydown', e => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        const target = list.querySelector('.create-row') || (input.value.trim() && list.querySelector('.check-row'));
-        if (target) { target.click(); input.value = ''; draw(); }
-      }
-    });
-    draw();
-    setTimeout(() => input.focus(), 0);
-    return h('div', { class: 'label-picker' },
-      h('div', { class: 'popover-title', text: 'Notiz mit Label versehen' }),
-      h('div', { class: 'label-picker-search' }, input, icon('search', 18)),
-      list);
-  }
-
-  function labelChips(ids, onRemove, navigate = true) {
-    const labs = ids.map(id => state.labels.find(l => l.id === id)).filter(Boolean).sort(byName);
-    if (!labs.length) return null;
-    return h('div', { class: 'chips' }, labs.map(lab => {
-      const chip = h('span', {
-        class: 'chip', title: lab.name,
-        onclick: e => { e.stopPropagation(); if (navigate) setView('label', lab.id); },
-      }, h('span', { class: 'chip-text', text: lab.name }));
-      if (onRemove) {
-        chip.append(h('button', {
-          type: 'button', class: 'chip-x', title: 'Label entfernen', 'aria-label': `Label ${lab.name} entfernen`,
-          onclick: e => { e.stopPropagation(); onRemove(lab.id); },
-        }, icon('close', 14)));
-      }
-      return chip;
-    }));
-  }
-
-  function pinButton(pinned, onPin) {
-    return iconBtn(pinned ? 'push_pin' : 'push_pin_outline', pinned ? 'Notiz loslösen' : 'Notiz anheften',
-      e => { e.stopPropagation(); onPin(); }, 'pin-btn' + (pinned ? ' on' : ''));
-  }
-
-  // ======================================================================
-  // Aktionen auf Notizen
-  // ======================================================================
-  /** Ändert eine Notiz sofort lokal (optimistisch) und speichert sie auf dem Server. */
-  async function updateNote(note, patch, { rerender = true } = {}) {
-    Object.assign(note, patch);
-    if ('trashed' in patch) note.trashed_at = patch.trashed ? Date.now() / 1000 : null;
-    if (rerender) render();
-    try {
-      const fresh = await api('PATCH', `/api/notes/${note.id}`, patch);
-      for (const k of Object.keys(patch)) note[k] = fresh[k];
-      note.updated_at = fresh.updated_at;
-      note.trashed_at = fresh.trashed_at;
-      if (rerender) render();
-    } catch (e) {
-      handleError(e);
-      reload();
-    }
-    return note;
-  }
-
-  function convertList(n) {
-    if (n.is_list) return { is_list: false, text: n.items.map(i => i.text).join('\n'), items: [] };
-    return {
-      is_list: true, text: '',
-      items: n.text.split('\n').filter(t => t.trim()).map(t => ({ id: uid(), text: t, checked: false })),
-    };
-  }
-
-  function actTogglePin(note) {
-    return updateNote(note, note.pinned ? { pinned: false } : { pinned: true, archived: false });
-  }
-
-  async function actArchive(note) {
-    const prev = { archived: note.archived, pinned: note.pinned };
-    await updateNote(note, { archived: !note.archived, pinned: false });
-    toast(prev.archived ? 'Archivierung der Notiz aufgehoben' : 'Notiz archiviert', 'Rückgängig', () => updateNote(note, prev));
-  }
-
-  async function actTrash(note) {
-    await updateNote(note, { trashed: true });
-    toast('Notiz in den Papierkorb verschoben', 'Rückgängig', () => updateNote(note, { trashed: false }));
-  }
-
-  async function actRestore(note) {
-    await updateNote(note, { trashed: false });
-    toast('Notiz wiederhergestellt', 'Rückgängig', () => updateNote(note, { trashed: true }));
-  }
-
-  async function actDeleteForever(note) {
-    if (!await confirmDialog('Notiz endgültig löschen?', 'Löschen')) return;
-    try {
-      await api('DELETE', `/api/notes/${note.id}`);
-      state.notes = state.notes.filter(n => n !== note);
-      render();
-    } catch (e) { handleError(e); }
-  }
-
-  async function actCopy(note) {
-    try {
-      const copy = await api('POST', `/api/notes/${note.id}/copy`);
-      state.notes.push(copy);
-      render();
-      toast('Kopie erstellt');
-    } catch (e) { handleError(e); }
-  }
-
-  async function actEmptyTrash() {
-    if (!await confirmDialog('Papierkorb leeren? Alle Notizen im Papierkorb werden endgültig gelöscht.', 'Papierkorb leeren')) return;
-    try {
-      await api('DELETE', '/api/trash');
-      state.notes = state.notes.filter(n => !n.trashed);
-      render();
-    } catch (e) { handleError(e); }
-  }
-
-  function toggleItem(note, itemId) {
-    const items = note.items.map(i => (i.id === itemId ? { ...i, checked: !i.checked } : i));
-    updateNote(note, { items });
-  }
-
-  async function createLabel(name) {
-    const lab = await api('POST', '/api/labels', { name });
-    state.labels.push(lab);
-    renderSidebar();
-    return lab;
-  }
-
-  async function reorder(list, moved, target) {
-    const ids = list.map(n => n.id);
-    const positions = list.map(n => n.position);
-    ids.splice(ids.indexOf(moved.id), 1);
-    ids.splice(list.indexOf(target), 0, moved.id);
-    ids.forEach((id, i) => { findNote(id).position = positions[i]; });
+  clearSelection();
+  toast(list.length > 1 ? `${list.length} Kopien erstellt` : 'Kopie erstellt');
+}
+async function actEmptyTrash() {
+  if (!await confirmDialog('Papierkorb leeren? Alle Notizen im Papierkorb werden endgültig gelöscht.', 'Papierkorb leeren')) return;
+  try {
+    await api('DELETE', 'api/trash');
+    for (const n of [...state.notes.values()]) if (n.trashed) state.notes.delete(n.id);
     render();
+  } catch (e) { handleError(e); }
+}
+
+async function uploadImages(n, files) {
+  for (const file of files.filter(f => f.type.startsWith('image/'))) {
+    const ph = { uploading: true, url: URL.createObjectURL(file), w: 4, h: 3 };
+    n.images = [...n.images, ph];
+    if (editor && editor.note === n) editor.ed.refreshMeta();
+    noteChanged(n.id);
     try {
-      await api('POST', '/api/notes/reorder', { ids });
+      const blob = await shrinkImage(file, 2560, file.type === 'image/png' ? 'image/png' : 'image/jpeg', 0.9);
+      const img = await api('POST', `api/notes/${n.id}/images`, blob, { raw: true, contentType: blob.type || file.type });
+      n.images = n.images.map(x => (x === ph ? img : x));
     } catch (e) {
+      n.images = n.images.filter(x => x !== ph);
       handleError(e);
-      reload();
     }
+    URL.revokeObjectURL(ph.url);
+    if (editor && editor.note === n) editor.ed.refreshMeta();
+    noteChanged(n.id);
   }
+}
 
-  // ======================================================================
-  // Editor (wird für das Eingabefeld oben und für das Bearbeiten-Modal genutzt)
-  // ======================================================================
-  function createEditor(draft, { mode, readOnly = false, onChange = () => {}, actions }) {
-    const root = h('div', { class: `editor is-${mode}` });
-    const titleEl = h('textarea', { class: 'ed-title', placeholder: 'Titel', rows: '1', maxlength: '1000', 'aria-label': 'Titel' });
-    titleEl.value = draft.title;
-    titleEl.readOnly = readOnly;
-    const pinSlot = h('div', { class: 'ed-pin' });
-    const body = h('div', { class: 'ed-body' });
-    const chipsSlot = h('div', { class: 'ed-chips' });
-    const meta = h('div', { class: 'ed-meta' });
-    const toolbar = h('div', { class: 'ed-toolbar' });
-    root.append(h('div', { class: 'editor-scroll' }, h('div', { class: 'ed-head' }, titleEl, pinSlot), body, chipsSlot, meta), toolbar);
+async function removeImage(n, img) {
+  if (!await confirmDialog('Bild aus der Notiz entfernen?', 'Entfernen')) return;
+  n.images = n.images.filter(x => x.id !== img.id);
+  if (editor && editor.note === n) editor.ed.refreshMeta();
+  noteChanged(n.id);
+  try { await api('DELETE', `api/notes/${n.id}/images/${img.id}`); } catch (e) { handleError(e); reloadAll(); }
+}
 
-    let textEl = null;
-    let doneOpen = true;
-    const itemEls = new Map();
+function toggleItemFromCard(n, itemId) {
+  const it = n.ns.doc.items.find(i => i.id === itemId);
+  if (it) n.ns.applyLocal([{ k: 'item_set', id: itemId, checked: !it.checked }]);
+}
 
-    titleEl.addEventListener('input', () => { draft.title = titleEl.value.replace(/\n/g, ' '); autoGrow(titleEl); onChange(); });
-    titleEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); focusBody(); } });
+async function reorder(list, moved, target) {
+  const ids = list.map(n => n.id);
+  const positions = list.map(n => n.position);
+  ids.splice(ids.indexOf(moved.id), 1);
+  ids.splice(list.indexOf(target), 0, moved.id);
+  ids.forEach((id, i) => { state.notes.get(id).position = positions[i]; });
+  renderMain();
+  try { await api('POST', 'api/notes/reorder', { ids }); } catch (e) { handleError(e); reloadAll(); }
+}
 
-    function focusBody() {
-      if (textEl) {
-        textEl.focus();
-        textEl.setSelectionRange(textEl.value.length, textEl.value.length);
-      } else {
-        const add = body.querySelector('.ed-add-input');
-        if (add) add.focus();
-      }
-    }
+function moveFocused(dir) {
+  const n = state.notes.get(state.focusedId);
+  if (!n) return;
+  const card = document.querySelector(`.note-card[data-key="${n.id}"]`);
+  const list = card && card._list;
+  if (!list) return;
+  const i = list.indexOf(n);
+  const target = list[i + dir];
+  if (target) reorder(list, n, target).then(() => focusNote(n.id));
+}
 
-    function removeItem(it) {
-      draft.items.splice(draft.items.indexOf(it), 1);
-      onChange();
-    }
-
-    function itemRow(it) {
-      const ta = h('textarea', { class: 'ed-item-text', rows: '1', maxlength: '5000', 'aria-label': 'Listenelement' });
-      ta.value = it.text;
-      ta.readOnly = readOnly;
-      itemEls.set(it.id, ta);
-      const row = h('div', { class: 'ed-item' + (it.checked ? ' checked' : '') },
-        h('button', {
-          type: 'button', class: 'ed-check', disabled: readOnly,
-          title: it.checked ? 'Als nicht erledigt markieren' : 'Als erledigt markieren',
-          'aria-label': it.checked ? 'Als nicht erledigt markieren' : 'Als erledigt markieren',
-          onclick: () => { it.checked = !it.checked; onChange(); renderBody(); },
-        }, icon(it.checked ? 'check_box' : 'check_box_outline_blank', 20)),
-        ta);
-      if (readOnly) return row;
-
-      row.append(iconBtn('close', 'Element löschen', () => { removeItem(it); renderBody(); }, 'ed-item-del'));
-      ta.addEventListener('input', () => {
-        if (ta.value.includes('\n')) { // eingefügter mehrzeiliger Text → mehrere Elemente
-          const lines = ta.value.split(/\r?\n/);
-          it.text = lines.shift();
-          let idx = draft.items.indexOf(it);
-          let last = it;
-          for (const line of lines) {
-            last = { id: uid(), text: line, checked: it.checked };
-            draft.items.splice(++idx, 0, last);
-          }
-          onChange();
-          renderBody({ id: last.id });
-          return;
-        }
-        it.text = ta.value;
-        autoGrow(ta);
-        onChange();
-      });
-      ta.addEventListener('keydown', e => {
-        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
-          e.preventDefault();
-          const before = ta.value.slice(0, ta.selectionStart);
-          const after = ta.value.slice(ta.selectionEnd);
-          it.text = before;
-          const next = { id: uid(), text: after, checked: it.checked };
-          draft.items.splice(draft.items.indexOf(it) + 1, 0, next);
-          onChange();
-          renderBody({ id: next.id, pos: 0 });
-        } else if (e.key === 'Backspace' && ta.selectionStart === 0 && ta.selectionEnd === 0) {
-          const group = draft.items.filter(i => i.checked === it.checked);
-          const prev = group[group.indexOf(it) - 1];
-          if (prev) {
-            e.preventDefault();
-            const pos = prev.text.length;
-            prev.text += it.text;
-            removeItem(it);
-            renderBody({ id: prev.id, pos });
-          } else if (!it.text) {
-            e.preventDefault();
-            removeItem(it);
-            renderBody(group[1] ? { id: group[1].id, pos: 0 } : { add: true });
-          }
-        } else if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !e.shiftKey) {
-          const rows = [...body.querySelectorAll('.ed-item-text, .ed-add-input')];
-          const i = rows.indexOf(ta);
-          const atStart = ta.selectionStart === 0;
-          const atEnd = ta.selectionEnd === ta.value.length;
-          const target = e.key === 'ArrowUp' ? (atStart ? rows[i - 1] : null) : (atEnd ? rows[i + 1] : null);
-          if (target) { e.preventDefault(); target.focus(); }
-        }
-      });
-      return row;
-    }
-
-    function renderBody(focus) {
-      body.replaceChildren();
-      itemEls.clear();
-      textEl = null;
-
-      if (!draft.is_list) {
-        textEl = h('textarea', { class: 'ed-text', placeholder: 'Notiz schreiben…', 'aria-label': 'Notiz', maxlength: '100000' });
-        textEl.value = draft.text;
-        textEl.readOnly = readOnly;
-        textEl.addEventListener('input', () => { draft.text = textEl.value; autoGrow(textEl); onChange(); });
-        body.append(textEl);
-        requestAnimationFrame(() => autoGrow(textEl));
-        return;
-      }
-
-      const open = draft.items.filter(i => !i.checked);
-      const done = draft.items.filter(i => i.checked);
-      const list = h('div', { class: 'ed-list' }, open.map(itemRow));
-      if (!readOnly) {
-        const addInput = h('input', { type: 'text', class: 'ed-add-input', placeholder: 'Listenelement', 'aria-label': 'Neues Listenelement' });
-        addInput.addEventListener('input', () => {
-          if (!addInput.value) return;
-          const it = { id: uid(), text: addInput.value, checked: false };
-          const lastOpen = [...draft.items].reverse().find(i => !i.checked);
-          draft.items.splice(lastOpen ? draft.items.indexOf(lastOpen) + 1 : 0, 0, it);
-          onChange();
-          renderBody({ id: it.id });
-        });
-        addInput.addEventListener('keydown', e => {
-          if (e.key === 'ArrowUp') {
-            const items = body.querySelectorAll('.ed-list:not(.done) .ed-item-text');
-            if (items.length) { e.preventDefault(); items[items.length - 1].focus(); }
-          }
-        });
-        list.append(h('div', { class: 'ed-add' }, icon('add', 20), addInput));
-      }
-      body.append(list);
-
-      if (done.length) {
-        body.append(
-          h('div', { class: 'ed-divider' }),
-          h('button', {
-            type: 'button', class: 'ed-done-toggle' + (doneOpen ? ' open' : ''), 'aria-expanded': String(doneOpen),
-            onclick: () => { doneOpen = !doneOpen; renderBody(); },
-          }, icon('expand_more', 20), h('span', { text: plural(done.length, 'erledigtes Element', 'erledigte Elemente') })));
-        if (doneOpen) body.append(h('div', { class: 'ed-list done' }, done.map(itemRow)));
-      }
-
-      if (focus) {
-        const ta = focus.id && itemEls.get(focus.id);
-        if (ta) {
-          ta.focus();
-          const pos = focus.pos ?? ta.value.length;
-          ta.setSelectionRange(pos, pos);
-        } else if (focus.add) {
-          const add = body.querySelector('.ed-add-input');
-          if (add) add.focus();
-        }
-      }
-      requestAnimationFrame(() => itemEls.forEach(autoGrow));
-    }
-
-    function toggleList() {
-      Object.assign(draft, convertList(draft));
-      onChange();
-      renderBody(draft.is_list ? { add: true } : null);
-      if (!draft.is_list) focusBody();
-      renderToolbar();
-    }
-
-    function renderToolbar() {
-      const tools = h('div', { class: 'ed-tools' });
-      if (readOnly) {
-        tools.append(
-          iconBtn('delete_forever', 'Endgültig löschen', () => actions.deleteForever()),
-          iconBtn('restore_from_trash', 'Wiederherstellen', () => actions.restore()));
-      } else {
-        const more = [];
-        if (actions.trash) more.push({ label: 'Notiz löschen', action: actions.trash });
-        if (actions.copy) more.push({ label: 'Kopie erstellen', action: actions.copy });
-        more.push({ label: draft.is_list ? 'Kästchen ausblenden' : 'Kästchen anzeigen', action: toggleList });
-        tools.append(
-          iconBtn('palette', 'Hintergrundoptionen', e => openPopover(e.currentTarget, palettePopover(draft.color, c => actions.setColor(c)))),
-          iconBtn('label', 'Label hinzufügen', e => openPopover(e.currentTarget, labelPopover(() => draft.labels, ids => actions.setLabels(ids)))),
-          iconBtn(draft.archived ? 'unarchive' : 'archive', draft.archived ? 'Archivierung aufheben' : 'Archivieren', () => actions.archive()),
-          iconBtn('more_vert', 'Mehr', e => openPopover(e.currentTarget, menuPopover(more))));
-      }
-      toolbar.replaceChildren(tools, h('button', { type: 'button', class: 'text-btn ed-close', onclick: () => actions.close() }, 'Schließen'));
-    }
-
-    function refreshMeta() {
-      if (readOnly) meta.textContent = 'Notizen im Papierkorb können nicht bearbeitet werden';
-      else if (mode === 'modal' && draft.updated_at) {
-        meta.textContent = `Bearbeitet: ${fmtDate(draft.updated_at)}`;
-        meta.title = `Erstellt: ${new Date(draft.created_at * 1000).toLocaleString('de-DE')}`;
-      } else meta.textContent = '';
-    }
-
-    function refresh(withToolbar = true) {
-      root.dataset.color = draft.color;
-      pinSlot.replaceChildren();
-      if (!readOnly) pinSlot.append(pinButton(draft.pinned, () => actions.pin()));
-      chipsSlot.replaceChildren();
-      const chips = labelChips(draft.labels, readOnly ? null : id => actions.setLabels(draft.labels.filter(x => x !== id)), false);
-      if (chips) chipsSlot.append(chips);
-      refreshMeta();
-      if (withToolbar) renderToolbar();
-    }
-
-    function grow() {
-      autoGrow(titleEl);
-      if (textEl) autoGrow(textEl);
-      itemEls.forEach(autoGrow);
-    }
-
-    refresh();
-    renderBody();
-    return { root, refresh, refreshMeta, grow, focusBody, focusTitle: () => titleEl.focus() };
-  }
-
-  // ----------------------------------------------------------------------
-  // Bearbeiten-Modal
-  // ----------------------------------------------------------------------
-  function openEditor(note) {
-    closePopover();
-    if (composer.expanded) closeComposer();
-    const draft = JSON.parse(JSON.stringify(note));
-    const readOnly = !!note.trashed;
-    let timer = null;
-    let dirty = false;
-    let finished = Promise.resolve();
-
-    const save = async () => {
-      clearTimeout(timer);
-      if (!dirty) return;
-      dirty = false;
-      const patch = { title: draft.title, text: draft.text, items: draft.items, is_list: draft.is_list };
-      try {
-        const fresh = await api('PATCH', `/api/notes/${note.id}`, patch);
-        for (const k of ['title', 'text', 'items', 'is_list', 'updated_at']) note[k] = fresh[k];
-        draft.updated_at = fresh.updated_at;
-        ed.refreshMeta();
-      } catch (e) {
-        dirty = true;
-        handleError(e);
-      }
-    };
-
-    const local = (patch, withToolbar = true) => {
-      Object.assign(draft, patch);
-      ed.refresh(withToolbar);
-      updateNote(note, patch, { rerender: false });
-    };
-    const after = async fn => { entry.close(); await finished; fn(); };
-
-    const ed = createEditor(draft, {
-      mode: 'modal',
-      readOnly,
-      onChange: () => { dirty = true; clearTimeout(timer); timer = setTimeout(save, 600); },
-      actions: {
-        pin: () => local(draft.pinned ? { pinned: false } : { pinned: true, archived: false }),
-        setColor: c => local({ color: c }),
-        setLabels: ids => local({ labels: ids }, false),
-        archive: () => after(() => actArchive(note)),
-        trash: () => after(() => actTrash(note)),
-        copy: () => after(() => actCopy(note)),
-        restore: () => after(() => actRestore(note)),
-        deleteForever: () => after(() => actDeleteForever(note)),
-        close: () => entry.close(),
-      },
-    });
-
-    editor = { note };
-    const entry = openModal(ed.root, {
-      className: 'editor-modal',
-      onClose: () => {
-        finished = (async () => {
-          await save();
-          if (editor && editor.note === note) editor = null;
-          render();
-        })();
-      },
-    });
-    ed.grow();
-    const card = document.querySelector(`.note[data-id="${note.id}"]`);
-    if (card) card.classList.add('editing');
-  }
-
-  // ----------------------------------------------------------------------
-  // Eingabefeld "Notiz schreiben…"
-  // ----------------------------------------------------------------------
-  const composer = { expanded: false, draft: null, ed: null };
-
-  function renderComposer() {
-    const wrap = $('#composer-wrap');
-    if (composer.expanded) {
-      wrap.replaceChildren(h('div', { class: 'composer expanded' }, composer.ed.root));
-      composer.ed.grow();
+// ===========================================================================
+// Auswahl (Mehrfachauswahl wie im Original)
+// ===========================================================================
+let lastSelected = null;
+function toggleSelect(id, range = false) {
+  if (range && lastSelected != null) {
+    const order = visibleOrder();
+    const a = order.indexOf(lastSelected);
+    const b = order.indexOf(id);
+    if (a >= 0 && b >= 0) {
+      for (let i = Math.min(a, b); i <= Math.max(a, b); i++) state.selected.add(order[i]);
+      lastSelected = id;
+      renderSelection();
       return;
     }
-    wrap.replaceChildren(h('div', { class: 'composer collapsed' },
-      h('button', { type: 'button', class: 'composer-placeholder', onclick: () => expandComposer(false) }, 'Notiz schreiben…'),
-      iconBtn('check_box', 'Neue Liste', () => expandComposer(true))));
   }
-
-  function expandComposer(isList) {
-    if (composer.expanded) return;
-    const d = {
-      title: '', text: '', items: [], is_list: isList, color: 'default', pinned: false, archived: false,
-      labels: state.view === 'label' && state.labelId ? [state.labelId] : [],
-    };
-    composer.draft = d;
-    composer.expanded = true;
-    composer.ed = createEditor(d, {
-      mode: 'composer',
-      actions: {
-        pin: () => { d.pinned = !d.pinned; composer.ed.refresh(); },
-        setColor: c => { d.color = c; composer.ed.refresh(); },
-        setLabels: ids => { d.labels = ids; composer.ed.refresh(false); },
-        archive: () => { d.archived = true; d.pinned = false; closeComposer(); },
-        close: () => closeComposer(),
-      },
-    });
-    renderComposer();
-    composer.ed.focusBody();
+  if (state.selected.has(id)) state.selected.delete(id); else state.selected.add(id);
+  lastSelected = id;
+  renderSelection();
+}
+function clearSelection() {
+  if (!state.selected.size) return;
+  state.selected.clear();
+  renderSelection();
+}
+function selectAll() {
+  for (const id of visibleOrder()) state.selected.add(id);
+  renderSelection();
+}
+function renderSelection() {
+  for (const card of document.querySelectorAll('.note-card')) card.classList.toggle('selected', state.selected.has(Number(card.dataset.key)));
+  document.body.classList.toggle('selecting', state.selected.size > 0);
+  const bar = $('#selbar');
+  if (!state.selected.size) { bar.classList.remove('show'); return; }
+  const list = selectedNotes();
+  const count = h('span', { class: 'sel-count', text: `${list.length} ausgewählt` });
+  const tools = h('div', { class: 'sel-tools' });
+  if (state.view === 'trash') {
+    tools.append(iconBtn('delete_forever', 'Endgültig löschen', () => actDeleteForever(list)), iconBtn('restore_from_trash', 'Wiederherstellen', () => actRestore(list)));
+  } else {
+    const allPinned = list.every(n => n.pinned && !n.archived);
+    const pal = iconBtn('palette', 'Hintergrundoptionen', () => openPopover(pal, D.palette(null, c => actColor(list, c)), { align: 'end' }));
+    const more = iconBtn('more_vert', 'Mehr', () => openPopover(more, menu([
+      { label: 'Löschen', action: () => actTrash(list) },
+      { label: 'Label hinzufügen', action: () => openPopover(more, bulkLabelPicker(list), { align: 'end' }) },
+      { label: 'Kopie erstellen', action: () => actCopy(list) },
+    ]), { align: 'end' }));
+    tools.append(
+      iconBtn(allPinned ? 'push_pin' : 'push_pin_o', allPinned ? 'Loslösen' : 'Anheften', () => actPin(list)),
+      pal,
+      iconBtn(list.every(n => n.archived) ? 'unarchive' : 'archive', list.every(n => n.archived) ? 'Archivierung aufheben' : 'Archivieren', () => actArchive(list)),
+      more);
   }
-
-  async function closeComposer() {
-    if (!composer.expanded) return;
-    const d = composer.draft;
-    composer.expanded = false;
-    composer.draft = null;
-    composer.ed = null;
-    closePopover();
-    renderComposer();
-    d.items = d.items.filter(i => i.text.trim());
-    if (!d.title.trim() && !d.text.trim() && !d.items.length) return;
-    try {
-      const note = await api('POST', '/api/notes', {
-        title: d.title, text: d.text, items: d.items, is_list: d.is_list, color: d.color,
-        pinned: d.pinned, archived: d.archived, labels: d.labels,
-      });
-      state.notes.push(note);
-      render();
-      if (d.archived) toast('Notiz archiviert', 'Rückgängig', () => updateNote(note, { archived: false }));
-    } catch (e) { handleError(e); }
+  bar.replaceChildren(iconBtn('close', 'Auswahl aufheben', clearSelection), count, h('span', { class: 'grow' }), tools);
+  if (!bar.classList.contains('show')) {
+    bar.classList.add('show');
+    animate(bar, [{ transform: 'translateY(-100%)' }, { transform: 'none' }], { duration: 180 });
   }
-
-  // ======================================================================
-  // Darstellung
-  // ======================================================================
-  function viewTitle() {
-    if (state.view === 'archive') return 'Archiv';
-    if (state.view === 'trash') return 'Papierkorb';
-    if (state.view === 'label') {
-      const lab = state.labels.find(l => l.id === state.labelId);
-      return lab ? lab.name : 'Notizen';
+}
+function bulkLabelPicker(list) {
+  const common = () => state.labels.map(l => l.id).filter(id => list.every(n => n.labels.includes(id)));
+  return D.labelPicker(common, ids => {
+    const before = common();
+    const added = ids.filter(x => !before.includes(x));
+    const removed = before.filter(x => !ids.includes(x));
+    for (const n of list) {
+      const next = [...new Set([...n.labels.filter(x => !removed.includes(x)), ...added])];
+      patchNote(n, { labels: next });
     }
-    return 'Notizen';
-  }
+  });
+}
 
-  function render() {
-    renderSidebar();
-    renderHeader();
-    renderMain();
+// ===========================================================================
+// Ansicht & Navigation
+// ===========================================================================
+function viewTitle() {
+  if (state.view === 'archive') return 'Archiv';
+  if (state.view === 'trash') return 'Papierkorb';
+  if (state.view === 'label') {
+    const lab = state.labels.find(l => l.id === state.labelId);
+    return lab ? lab.name : 'Notizen';
   }
+  return 'Notizen';
+}
 
-  function renderHeader() {
-    const title = viewTitle();
-    $('#brand-title').textContent = title;
-    $('#brand-logo').classList.toggle('hidden', state.view !== 'notes');
-    document.title = state.view === 'notes' ? 'Notizen' : `${title} – Notizen`;
-    const lb = $('#layout-btn');
-    setIcon(lb, state.layout === 'grid' ? 'view_agenda' : 'grid_view');
-    const label = state.layout === 'grid' ? 'Listenansicht' : 'Rasteransicht';
-    lb.title = label;
-    lb.setAttribute('aria-label', label);
-  }
+function syncRoute() {
+  const hash = location.hash.slice(1);
+  const m = hash.match(/^label\/(\d+)$/);
+  if (hash === 'archive' || hash === 'trash') { state.view = hash; state.labelId = null; }
+  else if (m && state.labels.some(l => l.id === Number(m[1]))) { state.view = 'label'; state.labelId = Number(m[1]); }
+  else { state.view = 'notes'; state.labelId = null; }
+}
 
-  function renderSidebar() {
-    const nav = $('#sidebar');
-    const item = (iconName, label, onclick, active) => h('button', {
-      type: 'button', class: 'nav-item' + (active ? ' active' : ''), title: label, onclick,
-      'aria-current': active ? 'page' : null,
-    }, icon(iconName), h('span', { class: 'nav-label', text: label }));
-    nav.replaceChildren(
-      item('lightbulb', 'Notizen', () => setView('notes'), state.view === 'notes'),
-      ...sortedLabels().map(lab => item('label', lab.name, () => setView('label', lab.id), state.view === 'label' && state.labelId === lab.id)),
-      item('edit', 'Labels bearbeiten', openLabelsDialog, false),
-      item('archive', 'Archiv', () => setView('archive'), state.view === 'archive'),
-      item('delete', 'Papierkorb', () => setView('trash'), state.view === 'trash'));
-  }
+function setView(view, labelId = null) {
+  exitSearch(false);
+  const hash = view === 'notes' ? '' : view === 'label' ? `label/${labelId}` : view;
+  if (location.hash.slice(1) === hash) applyRoute(); else location.hash = hash;
+}
+app.setView = setView;
 
-  function noteHaystack(n) {
-    const labels = n.labels.map(id => (state.labels.find(l => l.id === id) || {}).name || '');
-    return [n.title, n.text, ...n.items.map(i => i.text), ...labels].join('\n').toLocaleLowerCase();
-  }
+function applyRoute() {
+  if (!state.user) return;
+  closeComposer();
+  clearSelection();
+  syncRoute();
+  document.body.classList.remove('nav-open');
+  window.scrollTo(0, 0);
+  render();
+}
 
-  function visibleNotes() {
-    const q = state.search.trim().toLocaleLowerCase();
-    let list = state.notes.filter(n => {
-      if (state.view === 'trash') return n.trashed;
-      if (n.trashed) return false;
-      if (state.view === 'archive') return n.archived;
-      if (state.view === 'label') return n.labels.includes(state.labelId);
-      return q ? true : !n.archived; // bei der Suche auch archivierte Notizen finden
-    });
+function visibleNotes() {
+  const q = state.search.trim().toLocaleLowerCase();
+  let list = [...state.notes.values()].filter(n => {
+    if (state.searching) return !n.trashed;
+    if (state.view === 'trash') return n.trashed;
+    if (n.trashed) return false;
+    if (state.view === 'archive') return n.archived;
+    if (state.view === 'label') return n.labels.includes(state.labelId);
+    return !n.archived;
+  });
+  if (state.searching) {
+    list = list.filter(n => matchesFilter(n, state.filter));
     if (q) {
       const words = q.split(/\s+/);
-      list = list.filter(n => { const hay = noteHaystack(n); return words.every(w => hay.includes(w)); });
-    }
-    return list.sort((a, b) => b.position - a.position || b.id - a.id);
-  }
-
-  function renderMain() {
-    const area = $('#notes-area');
-    const notice = $('#notice');
-    area.replaceChildren();
-    notice.replaceChildren();
-    const searching = state.search.trim() !== '';
-    $('#composer-wrap').classList.toggle('hidden', searching || !(state.view === 'notes' || state.view === 'label'));
-
-    if (state.view === 'trash' && state.notes.some(n => n.trashed)) {
-      notice.append(h('div', { class: 'trash-notice' },
-        h('span', { text: 'Notizen im Papierkorb werden nach 7 Tagen gelöscht.' }),
-        h('button', { type: 'button', class: 'text-btn primary', onclick: actEmptyTrash }, 'Papierkorb leeren')));
-    }
-
-    const notes = visibleNotes();
-    if (!notes.length) {
-      const [ic, text] = searching ? ['search', 'Keine passenden Ergebnisse'] : {
-        notes: ['lightbulb', 'Hier werden deine Notizen angezeigt'],
-        archive: ['archive', 'Hier werden archivierte Notizen angezeigt'],
-        trash: ['delete', 'Keine Notizen im Papierkorb'],
-        label: ['label', 'Keine Notizen mit diesem Label'],
-      }[state.view];
-      area.append(h('div', { class: 'empty' }, icon(ic, 120), h('p', { text })));
-      return;
-    }
-
-    const sections = [];
-    if (state.view === 'trash' || state.view === 'archive') {
-      sections.push([null, notes]);
-    } else {
-      const pinned = notes.filter(n => n.pinned && !n.archived);
-      const others = notes.filter(n => !(n.pinned && !n.archived));
-      if (pinned.length) sections.push(['Angeheftet', pinned]);
-      if (others.length) sections.push([pinned.length ? 'Andere' : null, others]);
-    }
-    for (const [title, list] of sections) {
-      const section = h('section', { class: 'notes-section' });
-      if (title) section.append(h('h2', { class: 'section-title', text: title }));
-      const grid = h('div', { class: 'grid' });
-      section.append(grid);
-      area.append(section);
-      layoutGrid(section, grid, list.map(n => buildCard(n, list)));
+      list = list.filter(n => { const hay = haystack(n); return words.every(w => hay.includes(w)); });
     }
   }
+  return list.sort((a, b) => b.position - a.position || b.id - a.id);
+}
 
-  /** Masonry-Layout: jede Karte kommt in die aktuell kürzeste Spalte (Reihenfolge links → rechts). */
-  function layoutGrid(section, grid, cards) {
-    const width = $('#notes-area').clientWidth;
-    let cols;
-    if (state.layout === 'list') {
-      cols = 1;
-      section.classList.add('list');
-    } else if (width < 2 * CARD_W + 3 * GAP) {
-      cols = width < 300 ? 1 : 2;
-      section.classList.add('fluid');
-    } else {
-      cols = Math.max(1, Math.floor((width + GAP) / (CARD_W + GAP)));
-    }
-    const columns = Array.from({ length: cols }, () => h('div', { class: 'col' }));
-    grid.append(...columns);
-    const heights = new Array(cols).fill(0);
-    for (const card of cards) {
-      const i = heights.indexOf(Math.min(...heights));
-      columns[i].append(card);
-      heights[i] = columns[i].offsetHeight;
-    }
+function sections() {
+  const notes = visibleNotes();
+  if (state.searching || state.view === 'trash' || state.view === 'archive') return [[null, notes]];
+  const pinned = notes.filter(n => n.pinned && !n.archived);
+  const others = notes.filter(n => !(n.pinned && !n.archived));
+  const out = [];
+  if (pinned.length) out.push(['Angeheftet', pinned]);
+  if (others.length) out.push([pinned.length ? 'Andere' : null, others]);
+  return out;
+}
+
+function visibleOrder() {
+  return [...document.querySelectorAll('#notes-area .note-card')]
+    .sort((a, b) => Number(a.dataset.order) - Number(b.dataset.order)).map(c => Number(c.dataset.key));
+}
+
+// ===========================================================================
+// Darstellung
+// ===========================================================================
+function render() {
+  renderSidebar();
+  renderHeader();
+  renderMain();
+}
+app.render = render;
+
+function renderHeader() {
+  const title = state.searching ? 'Suche' : viewTitle();
+  $('#brand-title').textContent = title;
+  $('#brand-logo').classList.toggle('hidden', state.view !== 'notes' || state.searching);
+  document.title = state.view === 'notes' && !state.searching ? 'Notizen' : `${title} – Notizen`;
+  const lb = $('#layout-btn');
+  setIcon(lb, state.layout === 'grid' ? 'view_agenda' : 'grid_view');
+  const label = `${state.layout === 'grid' ? 'Listenansicht' : 'Rasteransicht'} (${hintFor('toggleLayout')})`;
+  lb.title = label;
+  lb.setAttribute('aria-label', label);
+  const rb = $('#refresh-btn');
+  setIcon(rb, state.online ? 'refresh' : 'cloud_off');
+  rb.title = state.online ? `Aktualisieren (${hintFor('refresh')})` : 'Offline – Änderungen werden synchronisiert, sobald die Verbindung wieder besteht';
+  rb.classList.toggle('offline', !state.online);
+  // Suchfeld
+  document.body.classList.toggle('searching', state.searching);
+  setIcon($('#search-icon'), state.searching ? 'arrow_back' : 'search');
+  $('#search-icon').title = state.searching ? 'Suche beenden' : 'Suchen';
+  const chip = $('#search-chip');
+  chip.replaceChildren();
+  chip.classList.toggle('hidden', !state.filter);
+  if (state.filter) {
+    chip.append(icon(state.filter.icon || 'label', 18), h('span', { text: state.filter.label }),
+      h('button', { type: 'button', class: 'chip-x', 'aria-label': 'Filter entfernen', onclick: () => { state.filter = null; renderHeader(); renderMain(); $('#search-input').focus(); } }, icon('close', 14)));
   }
+  $('#search-clear').classList.toggle('hidden', !state.search && !state.filter);
+  renderAvatar();
+}
 
-  function buildCard(note, sectionList) {
-    const card = h('div', {
-      class: 'note', dataset: { id: note.id, color: note.color }, tabindex: '0', role: 'button',
-      'aria-label': note.title || 'Notiz öffnen',
-    });
-    if (editor && editor.note.id === note.id) card.classList.add('editing');
-    if (!note.trashed) card.append(pinButton(note.pinned, () => actTogglePin(note)));
+function renderAvatar() {
+  const btn = $('#account-btn');
+  btn.replaceChildren(avatar(state.user, 32));
+  btn.title = `Konto: ${state.user.username}`;
+}
 
-    const hasTitle = note.title.trim() !== '';
-    if (hasTitle) card.append(h('div', { class: 'note-title', text: note.title }));
-    if (note.is_list && note.items.length) {
-      card.append(checklistPreview(note));
-    } else if (!note.is_list && note.text.trim()) {
-      const big = !hasTitle && note.text.length <= 60 && note.text.split('\n').length <= 2;
-      card.append(h('div', { class: 'note-text' + (big ? ' big' : ''), text: note.text.length > 3000 ? note.text.slice(0, 3000) + '…' : note.text }));
-    } else if (!hasTitle) {
-      card.append(h('div', { class: 'note-text empty-note', text: 'Leere Notiz' }));
-    }
-    const chips = labelChips(note.labels, note.trashed ? null : id => updateNote(note, { labels: note.labels.filter(x => x !== id) }));
-    if (chips) card.append(chips);
-    card.append(cardToolbar(note));
+function renderSidebar() {
+  const nav = $('#sidebar');
+  const item = (iconName, label, onclick, active) => h('button', {
+    type: 'button', class: 'nav-item' + (active ? ' active' : ''), title: label, onclick,
+    'aria-current': active ? 'page' : null,
+  }, icon(iconName), h('span', { class: 'nav-label', text: label }));
+  const s = state.searching;
+  nav.replaceChildren(
+    item('lightbulb', 'Notizen', () => setView('notes'), !s && state.view === 'notes'),
+    ...D.sortedLabels().map(lab => item('label', lab.name, () => setView('label', lab.id), !s && state.view === 'label' && state.labelId === lab.id)),
+    item('edit', 'Labels bearbeiten', D.openLabelsDialog, false),
+    item('archive', 'Archiv', () => setView('archive'), !s && state.view === 'archive'),
+    item('delete', 'Papierkorb', () => setView('trash'), !s && state.view === 'trash'));
+}
 
-    card.addEventListener('click', e => { if (!e.target.closest('button, .chip')) openEditor(note); });
-    card.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target === card) openEditor(note); });
-    if (!note.trashed && state.view !== 'archive' && !state.search.trim()) enableDrag(card, note, sectionList);
-    return card;
+function renderMain() {
+  const area = $('#notes-area');
+  const notice = $('#notice');
+  const before = captureLayout(area, '.note-card');
+  area.replaceChildren();
+  notice.replaceChildren();
+  const q = state.search.trim();
+  const composerVisible = !state.searching && (state.view === 'notes' || state.view === 'label');
+  $('#composer-wrap').classList.toggle('hidden', !composerVisible);
+
+  if (state.searching && !q && !state.filter) {
+    renderSearchPanel(area);
+    return;
   }
-
-  function checklistPreview(note) {
-    const open = note.items.filter(i => !i.checked);
-    const done = note.items.filter(i => i.checked);
-    const wrap = h('div', { class: 'note-list' });
-    for (const it of open.slice(0, 12)) {
-      wrap.append(h('div', { class: 'li' },
-        h('button', {
-          type: 'button', class: 'li-check', disabled: note.trashed, title: 'Abhaken', 'aria-label': `„${it.text}“ abhaken`,
-          onclick: e => { e.stopPropagation(); toggleItem(note, it.id); },
-        }, icon('check_box_outline_blank', 18)),
-        h('span', { class: 'li-text', text: it.text })));
-    }
-    if (open.length > 12) wrap.append(h('div', { class: 'li-more', text: '…' }));
-    if (done.length) wrap.append(h('div', { class: 'li-done', text: '+ ' + plural(done.length, 'erledigtes Element', 'erledigte Elemente') }));
-    return wrap;
+  if (!state.searching && state.view === 'trash' && [...state.notes.values()].some(n => n.trashed)) {
+    notice.append(h('div', { class: 'trash-notice' },
+      h('span', { text: 'Notizen im Papierkorb werden nach 7 Tagen gelöscht.' }),
+      h('button', { type: 'button', class: 'text-btn primary', onclick: actEmptyTrash }, 'Papierkorb leeren')));
   }
+  const secs = sections();
+  if (!secs.length) {
+    const [ic, text] = state.searching ? ['search', 'Keine passenden Ergebnisse'] : {
+      notes: ['lightbulb', 'Hier werden deine Notizen angezeigt'],
+      archive: ['archive', 'Hier werden archivierte Notizen angezeigt'],
+      trash: ['delete', 'Keine Notizen im Papierkorb'],
+      label: ['label', 'Keine Notizen mit diesem Label'],
+    }[state.view];
+    const empty = h('div', { class: 'empty-state' }, icon(ic, 120), h('p', { text }));
+    area.append(empty);
+    animate(empty, [{ opacity: 0 }, { opacity: 1 }], { duration: 250 });
+    return;
+  }
+  let order = 0;
+  for (const [title, list] of secs) {
+    const section = h('section', { class: 'notes-section' });
+    if (title) section.append(h('h2', { class: 'section-title', text: title }));
+    const grid = h('div', { class: 'grid' });
+    section.append(grid);
+    area.append(section);
+    const cards = list.map(n => { const c = buildCard(n, list); c._list = list; c.dataset.order = String(order++); return c; });
+    layoutGrid(section, grid, cards);
+  }
+  playLayout(area, '.note-card', before);
+}
 
-  function cardToolbar(note) {
-    const bar = h('div', { class: 'note-toolbar' });
-    const stop = fn => e => { e.stopPropagation(); fn(e); };
-    if (note.trashed) {
-      bar.append(
-        iconBtn('delete_forever', 'Endgültig löschen', stop(() => actDeleteForever(note))),
-        iconBtn('restore_from_trash', 'Wiederherstellen', stop(() => actRestore(note))));
-      return bar;
+function gridMetrics(width) {
+  if (state.layout === 'list') return { cols: 1, w: Math.min(width, 600), gap: 16 };
+  const small = width < 600;
+  const gap = small ? 8 : 16;
+  const min = small ? 150 : 240;
+  let cols = Math.max(1, Math.floor((width + gap) / (min + gap)));
+  if (width < 300) cols = 1;
+  const w = Math.min(small ? width : 300, Math.floor((width - gap * (cols - 1)) / cols));
+  return { cols, w, gap };
+}
+
+/** Masonry: jede Karte kommt in die aktuell kürzeste Spalte (Reihenfolge links → rechts). */
+function layoutGrid(section, grid, cards) {
+  const width = $('#notes-area').clientWidth;
+  const { cols, w, gap } = gridMetrics(width);
+  section.style.setProperty('--card-w', `${w}px`);
+  section.style.setProperty('--gap', `${gap}px`);
+  section.classList.toggle('list', state.layout === 'list');
+  const columns = Array.from({ length: cols }, () => h('div', { class: 'col' }));
+  grid.append(...columns);
+  const heights = new Array(cols).fill(0);
+  for (const card of cards) {
+    const i = heights.indexOf(Math.min(...heights));
+    columns[i].append(card);
+    heights[i] = columns[i].offsetHeight;
+  }
+}
+
+function imageGrid(images, cls) {
+  const shown = images.slice(0, 6);
+  const wrap = h('div', { class: cls, dataset: { count: String(shown.length) } });
+  for (const img of shown) {
+    const ratio = img.w && img.h ? img.w / img.h : 4 / 3;
+    wrap.append(h('div', { class: 'img-tile' + (img.uploading ? ' uploading' : ''), style: { aspectRatio: shown.length === 1 ? String(Math.max(0.5, Math.min(ratio, 3))) : '' } },
+      h('img', { src: img.url || `api/images/${img.id}`, alt: '', loading: 'lazy', draggable: 'false' })));
+  }
+  return wrap;
+}
+
+function buildCard(n, list) {
+  const doc = n.ns.doc;
+  const card = h('div', {
+    class: 'note-card', dataset: { key: n.id, color: n.color }, tabindex: '0', role: 'article',
+    'aria-label': doc.title || 'Notiz',
+  });
+  if (state.selected.has(n.id)) card.classList.add('selected');
+  if (state.focusedId === n.id) card.classList.add('kbd-focus');
+  if (editor && editor.note === n) card.classList.add('editing');
+  card.append(h('button', {
+    type: 'button', class: 'sel-check', title: 'Notiz auswählen', 'aria-label': 'Notiz auswählen',
+    onclick: e => { e.stopPropagation(); toggleSelect(n.id, e.shiftKey); },
+  }, icon('check_circle', 24)));
+  if (!n.trashed) {
+    card.append(iconBtn(n.pinned && !n.archived ? 'push_pin' : 'push_pin_o', n.pinned ? 'Notiz loslösen' : 'Notiz anheften',
+      e => { e.stopPropagation(); actPin([n]); }, 'pin-btn' + (n.pinned && !n.archived ? ' on' : '')));
+  }
+  if (n.images.length) card.append(imageGrid(n.images, 'card-images'));
+  const hasTitle = doc.title.trim() !== '';
+  if (hasTitle) card.append(h('div', { class: 'note-title', text: doc.title }));
+  if (doc.is_list && doc.items.length) {
+    card.append(checklistPreview(n));
+  } else if (!doc.is_list && doc.body.length() > 1) {
+    const body = h('div', { class: 'note-body' });
+    const text = doc.body.text();
+    const big = !hasTitle && !n.images.length && text.length <= 60 && text.split('\n').length <= 3 && !doc.body.ops.some(o => o.attributes);
+    if (big) body.classList.add('big');
+    body.innerHTML = renderHTML(doc.body, { rich: true, links: true, maxChars: 1500 });
+    for (const a of body.querySelectorAll('a')) a.addEventListener('click', e => e.stopPropagation());
+    card.append(body);
+  } else if (!hasTitle && !n.images.length) {
+    card.append(h('div', { class: 'note-body empty-note', text: 'Leere Notiz' }));
+  }
+  const chips = D.labelChips(n.labels, n.trashed ? null : id => patchNote(n, { labels: n.labels.filter(x => x !== id) }));
+  const others = n.members.filter(m => m.id !== state.user.id);
+  if (chips || others.length) {
+    const row = h('div', { class: 'card-meta' });
+    if (chips) row.append(chips);
+    if (others.length) {
+      row.append(h('div', { class: 'collab-avatars' }, others.slice(0, 4).map(u => avatar(u, 26)),
+        others.length > 4 ? h('span', { class: 'avatar more', text: `+${others.length - 4}` }) : null));
     }
-    bar.append(
-      iconBtn('palette', 'Hintergrundoptionen', stop(e => openPopover(e.currentTarget, palettePopover(note.color, c => updateNote(note, { color: c }))))),
-      iconBtn('label', 'Label hinzufügen', stop(e => openPopover(e.currentTarget, labelPopover(() => note.labels, ids => updateNote(note, { labels: ids }))))),
-      iconBtn(note.archived ? 'unarchive' : 'archive', note.archived ? 'Archivierung aufheben' : 'Archivieren', stop(() => actArchive(note))),
-      iconBtn('more_vert', 'Mehr', stop(e => openPopover(e.currentTarget, menuPopover([
-        { label: 'Notiz löschen', action: () => actTrash(note) },
-        { label: 'Kopie erstellen', action: () => actCopy(note) },
-        { label: note.is_list ? 'Kästchen ausblenden' : 'Kästchen anzeigen', action: () => updateNote(note, convertList(note)) },
-      ])))));
+    card.append(row);
+  }
+  card.append(cardToolbar(n));
+
+  card.addEventListener('click', e => {
+    if (e.target.closest('button, .chip, a')) return;
+    if (state.selected.size) { toggleSelect(n.id, e.shiftKey); return; }
+    openEditor(n, card);
+  });
+  card.addEventListener('focus', () => { state.focusedId = n.id; });
+  if (!n.trashed && !state.searching && state.view !== 'archive') enableDrag(card, n, list);
+  return card;
+}
+
+function checklistPreview(n) {
+  const items = n.ns.doc.items;
+  const bottom = setting('checkedBottom');
+  const open = bottom ? items.filter(i => !i.checked) : items;
+  const done = bottom ? items.filter(i => i.checked) : [];
+  const wrap = h('div', { class: 'note-list' });
+  for (const it of open.slice(0, 10)) {
+    wrap.append(h('div', { class: 'li' + (it.checked ? ' done' : '') },
+      h('button', {
+        type: 'button', class: 'li-check', disabled: n.trashed, title: it.checked ? 'Nicht erledigt' : 'Erledigt', 'aria-label': `„${it.text}“ ${it.checked ? 'nicht erledigt' : 'erledigt'}`,
+        onclick: e => { e.stopPropagation(); toggleItemFromCard(n, it.id); },
+      }, icon(it.checked ? 'check_box' : 'check_box_o', 18)),
+      h('span', { class: 'li-text', text: it.text })));
+  }
+  if (open.length > 10) wrap.append(h('div', { class: 'li-more', text: '…' }));
+  if (done.length) wrap.append(h('div', { class: 'li-done', text: '+ ' + plural(done.length, 'erledigtes Element', 'erledigte Elemente') }));
+  return wrap;
+}
+
+function cardToolbar(n) {
+  const bar = h('div', { class: 'card-toolbar' });
+  const stop = fn => e => { e.stopPropagation(); fn(e); };
+  if (n.trashed) {
+    bar.append(iconBtn('delete_forever', 'Endgültig löschen', stop(() => actDeleteForever([n])), '', 18),
+      iconBtn('restore_from_trash', 'Wiederherstellen', stop(() => actRestore([n])), '', 18));
     return bar;
   }
+  const pal = iconBtn('palette', 'Hintergrundoptionen', stop(() => openPopover(pal, D.palette(n.color, c => actColor([n], c)))), '', 18);
+  const more = iconBtn('more_vert', 'Mehr', stop(() => openPopover(more, menu([
+    { label: n.role === 'owner' ? 'Notiz löschen' : 'Notiz entfernen', action: () => actTrash([n]) },
+    { label: n.labels.length ? 'Label ändern' : 'Label hinzufügen', action: () => openPopover(more, D.labelPicker(() => n.labels, ids => patchNote(n, { labels: ids }))) },
+    { label: 'Kopie erstellen', action: () => actCopy([n]) },
+    { label: n.ns.doc.is_list ? 'Kästchen ausblenden' : 'Kästchen anzeigen', action: () => convertFromCard(n) },
+    { label: 'Versionsverlauf', action: () => D.openVersions(n) },
+  ]))), '', 18);
+  bar.append(
+    iconBtn('person_add_o', 'Mitbearbeiter', stop(() => D.openShareDialog(n)), '', 18),
+    pal,
+    iconBtn('image_o', 'Bild hinzufügen', stop(async () => { const f = await pickFiles(); if (f.length) uploadImages(n, f); }), '', 18),
+    iconBtn(n.archived ? 'unarchive' : 'archive', n.archived ? 'Archivierung aufheben' : 'Archivieren', stop(() => actArchive([n])), '', 18),
+    more);
+  return bar;
+}
 
-  // Drag & Drop zum Umsortieren (Desktop)
-  let drag = null;
-  function enableDrag(card, note, list) {
-    card.draggable = true;
-    card.addEventListener('dragstart', e => {
-      drag = { note, list };
-      card.classList.add('dragging');
-      e.dataTransfer.effectAllowed = 'move';
-      try { e.dataTransfer.setData('text/plain', String(note.id)); } catch { /* egal */ }
+function convertFromCard(n) {
+  // Gleiche Logik wie im Editor; ein unsichtbarer Editor erzeugt die Befehle
+  const tmp = new NoteEditor(n.ns, n, { mode: 'composer', actions: {} });
+  tmp.toggleChecks();
+  tmp.destroy();
+}
+
+// Drag & Drop zum Umsortieren
+let drag = null;
+function enableDrag(card, n, list) {
+  card.draggable = true;
+  card.addEventListener('dragstart', e => {
+    if (state.selected.size) { e.preventDefault(); return; }
+    drag = { n, list };
+    card.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', String(n.id)); } catch { /* egal */ }
+  });
+  card.addEventListener('dragend', () => {
+    card.classList.remove('dragging');
+    drag = null;
+    document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'));
+  });
+  const accepts = () => drag && drag.list === list && drag.n !== n;
+  card.addEventListener('dragover', e => { if (accepts()) { e.preventDefault(); card.classList.add('drop-target'); } });
+  card.addEventListener('dragleave', () => card.classList.remove('drop-target'));
+  card.addEventListener('drop', e => {
+    if (!accepts()) return;
+    e.preventDefault();
+    const moved = drag.n;
+    drag = null;
+    reorder(list, moved, n);
+  });
+}
+
+// ===========================================================================
+// Suche mit Kategorien
+// ===========================================================================
+function renderSearchPanel(area) {
+  const notes = [...state.notes.values()].filter(n => !n.trashed);
+  const tile = (label, ic, onclick, cls = '') => h('button', { type: 'button', class: `cat-tile ${cls}`, onclick }, h('span', { class: 'cat-icon' }, icon(ic, 32)), h('span', { class: 'cat-label', text: label }));
+  const set = f => { state.filter = f; renderHeader(); renderMain(); };
+  const panel = h('div', { class: 'search-panel' });
+  const section = (title, items) => { if (items.length) panel.append(h('section', { class: 'cat-section' }, h('h3', { text: title }), h('div', { class: 'cat-grid' }, items))); };
+  section('Typen', TYPES.filter(t => notes.some(t[3])).map(t => tile(t[1], t[2], () => set({ kind: 'type', value: t[0], label: t[1], icon: t[2] }), 'type')));
+  section('Labels', D.sortedLabels().filter(l => notes.some(n => n.labels.includes(l.id))).map(l => tile(l.name, 'label', () => set({ kind: 'label', value: l.id, label: l.name, icon: 'label' }), 'lab')));
+  section('Dinge', THINGS.filter(t => notes.some(n => isThing(n, t))).map(t => tile(t[1], t[2], () => set({ kind: 'thing', value: t[0], label: t[1], icon: t[2] }), 'thing')));
+  const colors = D.COLORS.filter(([c]) => notes.some(n => n.color === c));
+  if (colors.length) {
+    panel.append(h('section', { class: 'cat-section' }, h('h3', { text: 'Farben' }), h('div', { class: 'color-row' },
+      colors.map(([c, name]) => h('button', { type: 'button', class: 'swatch big', dataset: { color: c }, title: name, 'aria-label': name, onclick: () => set({ kind: 'color', value: c, label: name, icon: 'palette' }) },
+        c === 'default' ? icon('format_color_reset', 20) : null)))));
+  }
+  if (!panel.children.length) panel.append(h('div', { class: 'empty-state' }, icon('search', 120), h('p', { text: 'Noch nichts zu durchsuchen' })));
+  area.append(panel);
+  animate(panel, [{ opacity: 0, transform: 'translateY(8px)' }, { opacity: 1, transform: 'none' }], { duration: 220 });
+}
+
+function enterSearch() {
+  if (state.searching) return;
+  closeComposer();
+  clearSelection();
+  state.searching = true;
+  render();
+}
+
+function exitSearch(rerender = true) {
+  if (!state.searching) return;
+  state.searching = false;
+  state.search = '';
+  state.filter = null;
+  $('#search-input').value = '';
+  $('#search-input').blur();
+  if (rerender) render();
+}
+
+// ===========================================================================
+// Eingabefeld „Notiz schreiben…“
+// ===========================================================================
+function renderComposer() {
+  const wrap = $('#composer-wrap');
+  if (composer.expanded) {
+    wrap.replaceChildren(h('div', { class: 'composer expanded' }, composer.ed.root));
+    return;
+  }
+  wrap.replaceChildren(h('div', { class: 'composer collapsed' },
+    h('button', { type: 'button', class: 'composer-placeholder', onclick: () => expandComposer() }, 'Notiz schreiben…'),
+    iconBtn('check_box', `Neue Liste (${hintFor('newList')})`, () => expandComposer({ list: true })),
+    iconBtn('image_o', 'Neue Notiz mit Bild', async () => { const f = await pickFiles(); if (f.length) expandComposer({ files: f }); })));
+}
+
+function expandComposer({ list = false, files = null, draft = null } = {}) {
+  if (composer.expanded) return;
+  exitSearch(false);
+  const ns = draft ? draft.ns : new NoteState(null, null);
+  if (!draft && list) ns.doc.is_list = true;
+  const meta = draft ? draft.meta : {
+    color: 'default', pinned: false, archived: false, collaborators: [], images: [],
+    labels: state.view === 'label' && state.labelId ? [state.labelId] : [],
+  };
+  composer.ns = ns;
+  composer.meta = meta;
+  composer.expanded = true;
+  const refresh = () => composer.ed && composer.ed.refreshMeta();
+  const addFiles = fs => {
+    for (const file of fs.filter(f => f.type.startsWith('image/'))) {
+      const img = { file, url: URL.createObjectURL(file), w: 4, h: 3 };
+      meta.images.push(img);
+      const probe = new Image();
+      probe.onload = () => { img.w = probe.naturalWidth; img.h = probe.naturalHeight; refresh(); };
+      probe.src = img.url;
+    }
+    refresh();
+  };
+  composer.ed = new NoteEditor(ns, meta, {
+    mode: 'composer',
+    actions: {
+      pin: () => { meta.pinned = !meta.pinned; refresh(); },
+      setColor: c => { meta.color = c; refresh(); },
+      setLabels: ids => { meta.labels = ids; refresh(); },
+      archive: () => { meta.archived = true; meta.pinned = false; closeComposer(); },
+      trash: () => { discardComposer(); },
+      share: () => D.openShareDialog(meta, { onSave: members => { meta.collaborators = members; refresh(); } }),
+      pickImages: async () => addFiles(await pickFiles()),
+      addImages: addFiles,
+      removeImage: img => { meta.images = meta.images.filter(x => x !== img); URL.revokeObjectURL(img.url); refresh(); },
+      viewImage: i => D.openLightbox(meta.images, i),
+      close: () => closeComposer(),
+    },
+  });
+  renderComposer();
+  if (files) addFiles(files);
+  composer.ed.focusStart();
+  animate(composer.ed.root, [{ opacity: 0.4, transform: 'scaleY(.9)' }, { opacity: 1, transform: 'none' }], { duration: 160 });
+}
+
+function discardComposer() {
+  if (!composer.expanded) return;
+  for (const img of composer.meta.images) URL.revokeObjectURL(img.url);
+  composer.ed.destroy();
+  composer.expanded = false;
+  composer.ed = composer.ns = composer.meta = null;
+  renderComposer();
+}
+
+async function closeComposer() {
+  if (!composer.expanded) return;
+  composer.ed.flush();
+  const { ns, meta, ed } = composer;
+  ed.destroy();
+  composer.expanded = false;
+  composer.ed = composer.ns = composer.meta = null;
+  closePopover();
+  renderComposer();
+  const d = ns.doc;
+  const items = d.items.filter(i => i.text.trim());
+  const empty = !d.title.trim() && (d.is_list ? !items.length : !d.body.text().trim()) && !meta.images.length;
+  if (empty) return;
+  try {
+    const view = await api('POST', 'api/notes', {
+      title: d.title, body: d.body.ops, items, is_list: d.is_list, color: meta.color,
+      pinned: meta.pinned, archived: meta.archived, labels: meta.labels, collaborators: meta.collaborators.map(u => u.id),
     });
-    card.addEventListener('dragend', () => {
-      card.classList.remove('dragging');
-      drag = null;
-      document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'));
-    });
-    const accepts = () => drag && drag.list === list && drag.note !== note;
-    card.addEventListener('dragover', e => { if (accepts()) { e.preventDefault(); card.classList.add('drop-target'); } });
-    card.addEventListener('dragleave', () => card.classList.remove('drop-target'));
-    card.addEventListener('drop', e => {
-      if (!accepts()) return;
-      e.preventDefault();
-      const moved = drag.note;
-      drag = null;
-      reorder(list, moved, note);
-    });
+    const n = upsertNote(view);
+    if (meta.archived) toast('Notiz archiviert', 'Rückgängig', () => patchNote(n, { archived: false }));
+    if (meta.images.length) await uploadImages(n, meta.images.map(i => i.file));
+    for (const img of meta.images) URL.revokeObjectURL(img.url);
+  } catch (e) {
+    handleError(e);
+    if (!(e instanceof AuthError)) { meta.archived = false; expandComposer({ draft: { ns, meta } }); }
   }
+}
 
-  // ======================================================================
-  // Dialoge: Labels bearbeiten, Passwort ändern, Konto
-  // ======================================================================
-  function openLabelsDialog() {
-    document.body.classList.remove('nav-open');
-    const err = h('div', { class: 'labels-error', role: 'alert' });
-    const list = h('div', { class: 'labels-list' });
-    const newInput = h('input', { type: 'text', placeholder: 'Neues Label erstellen', maxlength: '100', 'aria-label': 'Neues Label erstellen' });
-    const showErr = e => { if (!(e instanceof AuthError)) err.textContent = e.message; };
+// ===========================================================================
+// Bearbeiten-Dialog
+// ===========================================================================
+function cardOf(n) { return document.querySelector(`#notes-area .note-card[data-key="${n.id}"]`); }
 
-    const create = async () => {
-      const name = newInput.value.trim();
-      if (!name) return;
-      err.textContent = '';
-      try {
-        await createLabel(name);
-        newInput.value = '';
-        draw();
-        render();
-      } catch (e) { showErr(e); }
-    };
-    newInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); create(); } });
+function openEditor(n, cardEl = null) {
+  closePopover();
+  if (composer.expanded) closeComposer();
+  if (editor) editor.modal.close();
+  const card = cardEl || cardOf(n);
+  const from = card ? card.getBoundingClientRect() : null;
+  const actions = {
+    pin: () => actPin([n]),
+    setColor: c => actColor([n], c),
+    setLabels: ids => patchNote(n, { labels: ids }),
+    archive: () => { closeEditor(); actArchive([n]); },
+    trash: () => { closeEditor(); actTrash([n]); },
+    copy: () => { closeEditor(); actCopy([n]); },
+    restore: () => { closeEditor(); actRestore([n]); },
+    deleteForever: () => { closeEditor(); actDeleteForever([n]); },
+    share: () => D.openShareDialog(n),
+    pickImages: async () => { const f = await pickFiles(); if (f.length) uploadImages(n, f); },
+    addImages: files => uploadImages(n, files),
+    removeImage: img => removeImage(n, img),
+    viewImage: i => D.openLightbox(n.images, i, { onDelete: n.trashed ? null : img => removeImage(n, img) }),
+    versions: () => D.openVersions(n),
+    close: () => closeEditor(),
+  };
+  const ed = new NoteEditor(n.ns, n, { mode: 'modal', readOnly: n.trashed, actions });
+  editor = { ed, note: n };
+  if (card) card.classList.add('editing');
+  editor.modal = openModal(ed.root, {
+    className: 'editor-modal', from, label: 'Notiz bearbeiten',
+    onClose: () => {
+      ed.destroy();
+      if (editor && editor.ed === ed) editor = null;
+      const c = cardOf(n);
+      if (c) c.classList.remove('editing');
+      noteChanged(n.id);
+      relayoutSoon();
+    },
+  });
+  if (state.online) conn.send({ t: 'open', id: n.id });
+  if (!isTouch() && !n.trashed) ed.focusStart();
+}
 
-    const draw = () => {
-      list.replaceChildren();
-      for (const lab of sortedLabels()) {
-        const input = h('input', { type: 'text', maxlength: '100', 'aria-label': 'Labelname' });
-        input.value = lab.name;
-        const commit = async () => {
-          const name = input.value.trim();
-          if (!name || name === lab.name) { input.value = lab.name; return; }
-          try {
-            const upd = await api('PATCH', `/api/labels/${lab.id}`, { name });
-            lab.name = upd.name;
-            err.textContent = '';
-            render();
-          } catch (e) { showErr(e); input.value = lab.name; }
-        };
-        input.addEventListener('keydown', e => {
-          if (e.key === 'Enter') input.blur();
-          if (e.key === 'Escape') { e.stopPropagation(); input.value = lab.name; input.blur(); }
-        });
-        input.addEventListener('blur', commit);
-        const remove = async () => {
-          if (!await confirmDialog('Dieses Label wird gelöscht und aus allen Notizen entfernt. Die Notizen selbst bleiben erhalten.', 'Löschen')) return;
-          try {
-            await api('DELETE', `/api/labels/${lab.id}`);
-            state.labels = state.labels.filter(l => l !== lab);
-            state.notes.forEach(n => { n.labels = n.labels.filter(x => x !== lab.id); });
-            if (state.view === 'label' && state.labelId === lab.id) setView('notes');
-            draw();
-            render();
-          } catch (e) { showErr(e); }
-        };
-        list.append(h('div', { class: 'labels-row' },
-          iconBtn('delete', 'Label löschen', remove), input, iconBtn('edit', 'Label umbenennen', () => input.focus())));
-      }
-    };
-    draw();
+function closeEditor() {
+  if (!editor) return;
+  const c = cardOf(editor.note);
+  editor.modal.close(c ? c.getBoundingClientRect() : null);
+}
 
-    const content = h('div', { class: 'dialog labels-dialog' },
-      h('h3', { class: 'dialog-title', text: 'Labels bearbeiten' }),
-      h('div', { class: 'labels-row new' },
-        iconBtn('close', 'Eingabe leeren', () => { newInput.value = ''; newInput.focus(); }),
-        newInput,
-        iconBtn('check', 'Label erstellen', create)),
-      err, list,
-      h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'text-btn', onclick: () => m.close() }, 'Fertig')));
-    const m = openModal(content, { className: 'small' });
-    newInput.focus();
+// ===========================================================================
+// Tastenkürzel (global über das ganze Dokument)
+// ===========================================================================
+const isTyping = t => t && (t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT');
+
+function activeNoteEditor(target) {
+  if (editor && editor.ed.root.contains(target)) return { ed: editor.ed, close: closeEditor };
+  if (composer.expanded && composer.ed.root.contains(target)) return { ed: composer.ed, close: closeComposer };
+  if (editor && modals[modals.length - 1] === editor.modal) return { ed: editor.ed, close: closeEditor };
+  return null;
+}
+
+function focusNote(id) {
+  state.focusedId = id;
+  document.querySelectorAll('.note-card.kbd-focus').forEach(c => c.classList.remove('kbd-focus'));
+  const c = document.querySelector(`#notes-area .note-card[data-key="${id}"]`);
+  if (c) { c.classList.add('kbd-focus'); c.focus({ preventScroll: true }); c.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
+}
+
+function stepFocus(dir) {
+  const order = visibleOrder();
+  if (!order.length) return;
+  const i = order.indexOf(state.focusedId);
+  const next = i < 0 ? order[0] : order[Math.max(0, Math.min(order.length - 1, i + dir))];
+  focusNote(next);
+}
+
+function runAction(action) {
+  const focused = state.notes.get(state.focusedId);
+  const sel = state.selected.size ? selectedNotes() : focused ? [focused] : [];
+  switch (action) {
+    case 'newNote': if (state.view === 'notes' || state.view === 'label') expandComposer(); else { setView('notes'); setTimeout(() => expandComposer(), 50); } break;
+    case 'newList': if (state.view === 'notes' || state.view === 'label') expandComposer({ list: true }); else { setView('notes'); setTimeout(() => expandComposer({ list: true }), 50); } break;
+    case 'search': $('#search-input').focus(); break;
+    case 'next': stepFocus(1); break;
+    case 'prev': stepFocus(-1); break;
+    case 'moveNext': moveFocused(1); break;
+    case 'movePrev': moveFocused(-1); break;
+    case 'open': if (focused) openEditor(focused); break;
+    case 'select': if (focused) toggleSelect(focused.id); break;
+    case 'selectAll': selectAll(); break;
+    case 'archive': if (sel.length && state.view !== 'trash') actArchive(sel); break;
+    case 'trash': if (sel.length && state.view !== 'trash') actTrash(sel); break;
+    case 'pin': if (sel.length && state.view !== 'trash') actPin(sel); break;
+    case 'toggleLayout': toggleLayout(); break;
+    case 'toggleTheme': cycleTheme(); break;
+    case 'refresh': reloadAll(true); break;
+    case 'help': D.openShortcutHelp(); break;
+    case 'settings': D.openSettings(); break;
+    default: break;
   }
+}
 
-  function openPasswordDialog() {
-    const field = (label, autocomplete) => {
-      const input = h('input', { type: 'password', autocomplete, required: true, maxlength: '1024' });
-      return [h('label', { class: 'field' }, h('span', { text: label }), input), input];
-    };
-    const [f1, oldPw] = field('Aktuelles Passwort', 'current-password');
-    const [f2, newPw] = field('Neues Passwort (mind. 8 Zeichen)', 'new-password');
-    const [f3, newPw2] = field('Neues Passwort wiederholen', 'new-password');
-    const err = h('div', { class: 'form-error', role: 'alert' });
-    const form = h('form', { class: 'dialog', novalidate: true },
-      h('h3', { class: 'dialog-title', text: 'Passwort ändern' }), f1, f2, f3, err,
-      h('div', { class: 'dialog-actions' },
-        h('button', { type: 'button', class: 'text-btn', onclick: () => m.close() }, 'Abbrechen'),
-        h('button', { type: 'submit', class: 'text-btn primary' }, 'Speichern')));
-    form.addEventListener('submit', async e => {
-      e.preventDefault();
-      err.textContent = '';
-      if (newPw.value !== newPw2.value) { err.textContent = 'Die neuen Passwörter stimmen nicht überein.'; return; }
-      try {
-        await api('POST', '/api/password', { old_password: oldPw.value, new_password: newPw.value });
-        m.close();
-        toast('Passwort geändert. Andere Geräte wurden abgemeldet.');
-      } catch (e2) { if (!(e2 instanceof AuthError)) err.textContent = e2.message; }
-    });
-    const m = openModal(form, { className: 'small' });
-    oldPw.focus();
+function handleEscape(e) {
+  if (popoverOwner()) { closePopover(); e.preventDefault(); return; }
+  if (modals.length) { const top = modals[modals.length - 1]; if (editor && top === editor.modal) closeEditor(); else top.close(); e.preventDefault(); return; }
+  if (composer.expanded) { closeComposer(); e.preventDefault(); return; }
+  if (state.selected.size) { clearSelection(); e.preventDefault(); return; }
+  if (document.body.classList.contains('nav-open')) { document.body.classList.remove('nav-open'); return; }
+  if (state.searching) { exitSearch(); e.preventDefault(); }
+}
+
+function onGlobalKey(e) {
+  if (!state.user || e.defaultPrevented) return;
+  if (e.key === 'Escape') { handleEscape(e); return; }
+  if (e.isComposing) return;
+  const combo = comboFromEvent(e);
+  if (!combo) return;
+  const action = keymap().get(combo);
+  if (!action) return;
+  const typing = isTyping(e.target);
+  if (SHORTCUT_SCOPE[action] === 'editor') {
+    const target = activeNoteEditor(e.target);
+    if (!target) return;
+    if (action === 'closeEditor') { e.preventDefault(); target.close(); return; }
+    if ((action === 'undo' || action === 'redo') && e.target.tagName === 'INPUT') return;
+    if (target.ed.exec(action)) { e.preventDefault(); e.stopPropagation(); }
+    return;
   }
+  if (!setting('shortcutsEnabled')) return;
+  const plain = !combo.includes('Mod') && !combo.includes('Alt');
+  if (typing && (plain || action === 'selectAll')) return;
+  if (modals.length && action !== 'help') return;
+  e.preventDefault();
+  e.stopPropagation();
+  runAction(action);
+}
 
-  function openAccount(anchor) {
-    const name = state.user.username;
-    const av = h('div', { class: 'avatar big', text: (name[0] || '?').toUpperCase() });
-    av.style.background = avatarColor(name);
-    openPopover(anchor, h('div', { class: 'account-pop' },
-      h('div', { class: 'account-head' }, av, h('div', { class: 'account-name', text: name })),
-      menuPopover([
-        { label: THEMES[state.theme][1] + ' (wechseln)', action: cycleTheme },
-        { label: 'Passwort ändern', action: openPasswordDialog },
-        { label: 'Abmelden', action: logout },
-      ])));
+// ===========================================================================
+// Einstellungen, Design, Layout
+// ===========================================================================
+const darkMq = window.matchMedia('(prefers-color-scheme: dark)');
+function applyTheme() {
+  const pref = THEMES[setting('theme')] ? setting('theme') : 'system';
+  const theme = pref === 'system' ? (darkMq.matches ? 'dark' : 'light') : pref;
+  document.documentElement.dataset.theme = theme;
+  $('meta[name="theme-color"]').setAttribute('content', theme === 'dark' ? '#202124' : '#ffffff');
+}
+function cycleTheme() {
+  const order = ['system', 'light', 'dark'];
+  const next = order[(order.indexOf(setting('theme')) + 1) % order.length];
+  updateSettings({ theme: next });
+  toast(THEMES[next][1]);
+}
+function applySettings() {
+  applyTheme();
+  if (state.user) {
+    renderHeader();
+    renderMain();
+    if (editor) editor.ed.renderBody();
   }
+}
+app.applySettings = applySettings;
 
-  // ======================================================================
-  // Navigation (über die URL, damit Zurück-Taste & Lesezeichen funktionieren)
-  // ======================================================================
-  function syncRoute() {
-    const hash = location.hash.slice(1);
-    const m = hash.match(/^label\/(\d+)$/);
-    if (hash === 'archive' || hash === 'trash') { state.view = hash; state.labelId = null; }
-    else if (m && state.labels.some(l => l.id === Number(m[1]))) { state.view = 'label'; state.labelId = Number(m[1]); }
-    else { state.view = 'notes'; state.labelId = null; }
+function toggleLayout() {
+  state.layout = state.layout === 'grid' ? 'list' : 'grid';
+  store.set('layout', state.layout);
+  renderHeader();
+  renderMain();
+}
+
+async function changeAvatar() {
+  const [file] = await pickFiles({ accept: 'image/jpeg,image/png,image/webp', multiple: false });
+  if (!file) return;
+  try {
+    const jpeg = await shrinkImage(file, 512, 'image/jpeg', 0.9, true);
+    const info = await api('PUT', 'api/me/avatar', jpeg, { raw: true, contentType: 'image/jpeg' });
+    updateUser(info);
+    toast('Profilbild aktualisiert');
+  } catch (e) { handleError(e); }
+}
+async function removeAvatar() {
+  try { updateUser(await api('DELETE', 'api/me/avatar')); } catch (e) { handleError(e); }
+}
+app.changeAvatar = changeAvatar;
+app.removeAvatar = removeAvatar;
+
+function updateUser(info) {
+  state.users.set(info.id, info);
+  if (state.user && info.id === state.user.id) state.user = { ...state.user, avatar: info.avatar };
+  for (const n of state.notes.values()) for (const m of n.members) if (m.id === info.id) m.avatar = info.avatar;
+  if (editor) editor.ed.refreshMeta();
+  if (state.user) { renderAvatar(); renderMain(); }
+}
+
+// ===========================================================================
+// Server-Verbindung
+// ===========================================================================
+function onMessage(msg) {
+  if (!ready && msg.t !== 'hello' && msg.t !== 'pong') { queue.push(msg); return; }
+  const n = msg.id != null ? state.notes.get(msg.id) : null;
+  switch (msg.t) {
+    case 'op': if (n) n.ns.remote(msg); else if (msg.client !== conn.clientId) fetchNote(msg.id); break;
+    case 'ack': if (n) n.ns.ack(msg.rev, msg.cid); break;
+    case 'caught': if (n) n.ns.caught(); break;
+    case 'resync': fetchNote(msg.id, true); break;
+    case 'note': upsertNote(msg.note); break;
+    case 'gone': removeNote(msg.id, 'Die Notiz wurde gelöscht oder nicht mehr mit dir geteilt.'); break;
+    case 'cursor': if (editor && editor.note.id === msg.id) editor.ed.remoteCursor(msg); break;
+    case 'presence': if (editor && editor.note.id === msg.id) editor.ed.presence(msg); break;
+    case 'user': updateUser(msg.user); break;
+    case 'labels': api('GET', 'api/labels').then(l => { state.labels = l; render(); }).catch(handleError); break;
+    case 'settings': state.settings = msg.settings || {}; applySettings(); break;
+    case 'positions':
+      for (const [id, pos] of Object.entries(msg.positions)) { const x = state.notes.get(Number(id)); if (x) x.position = pos; }
+      scheduleRender();
+      break;
+    case 'error': toast(`Synchronisationsfehler: ${msg.message}`); break;
+    default: break;
   }
+}
 
-  function setView(view, labelId = null) {
-    const hash = view === 'notes' ? '' : view === 'label' ? `label/${labelId}` : view;
-    if (location.hash.slice(1) === hash) applyRoute();
-    else location.hash = hash;
+async function fetchNote(id, reset = false) {
+  try {
+    const view = await api('GET', `api/notes/${id}`);
+    const n = state.notes.get(id);
+    if (n && reset) { Object.assign(n, metaOf(view)); n.ns.reset(view); scheduleRender(); } else upsertNote(view);
+  } catch (e) {
+    if (e.status === 404) removeNote(id); else handleError(e);
   }
+}
 
-  function applyRoute() {
-    if (!state.user) return;
-    closeComposer();
+async function reloadAll(spin = false) {
+  const btn = $('#refresh-btn');
+  if (spin) btn.classList.add('spin');
+  try {
+    const [notes, labels] = await Promise.all([api('GET', 'api/notes'), api('GET', 'api/labels')]);
+    state.labels = labels;
+    const ids = new Set(notes.map(v => v.id));
+    for (const v of notes) upsertNote(v);
+    for (const id of [...state.notes.keys()]) if (!ids.has(id)) removeNote(id);
     syncRoute();
-    document.body.classList.remove('nav-open');
-    window.scrollTo(0, 0);
     render();
+  } catch (e) {
+    handleError(e);
+  } finally {
+    if (spin) setTimeout(() => btn.classList.remove('spin'), 400);
   }
+}
 
-  // ======================================================================
-  // Anmeldung & Laden
-  // ======================================================================
-  async function reload({ spin = false } = {}) {
-    const btn = $('#refresh-btn');
-    if (spin) btn.classList.add('spin');
-    try {
-      const [notes, labels] = await Promise.all([api('GET', '/api/notes'), api('GET', '/api/labels')]);
-      state.notes = editor ? notes.map(n => (n.id === editor.note.id ? editor.note : n)) : notes;
-      state.labels = labels;
-      syncRoute();
-      render();
-    } catch (e) {
-      handleError(e);
-    } finally {
-      if (spin) setTimeout(() => btn.classList.remove('spin'), 300);
-    }
-  }
+function onOpen() {
+  state.online = true;
+  if (!ready) return;
+  for (const n of state.notes.values()) if (n.ns.pending()) n.ns.catchup();
+  reloadAll();
+  if (editor) conn.send({ t: 'open', id: editor.note.id });
+}
 
-  function renderAvatar() {
-    const btn = $('#account-btn');
-    const name = state.user.username;
-    btn.textContent = (name[0] || '?').toUpperCase();
-    btn.style.background = avatarColor(name);
-    btn.title = `Konto: ${name}`;
-  }
+// ===========================================================================
+// Anmeldung & Start
+// ===========================================================================
+async function showApp() {
+  $('#login').classList.add('hidden');
+  $('#app').classList.remove('hidden');
+  state.layout = store.get('layout', 'grid') === 'list' ? 'list' : 'grid';
+  applyTheme();
+  renderAvatar();
+  renderComposer();
+  ready = false;
+  queue = [];
+  conn = new Connection({
+    onMessage,
+    onOpen,
+    onStatus: online => { state.online = online; if (state.user) renderHeader(); if (!online && ready) toast('Verbindung unterbrochen – Änderungen werden gespeichert, sobald sie wieder besteht.'); },
+    onAuthLost: () => showLogin(),
+  });
+  app.conn = conn;
+  state.clientId = conn.clientId;
+  conn.connect();
+  try {
+    const users = await api('GET', 'api/users');
+    for (const u of users) state.users.set(u.id, u);
+  } catch (e) { handleError(e); }
+  await reloadAll();
+  ready = true;
+  const pending = queue;
+  queue = [];
+  for (const m of pending) onMessage(m);
+}
 
-  async function showApp() {
-    loginShown = false;
-    $('#login').classList.add('hidden');
-    $('#app').classList.remove('hidden');
-    renderAvatar();
-    renderComposer();
-    await reload();
-  }
+function showLogin() {
+  if (conn) { conn.stop(); conn = null; app.conn = null; }
+  state.user = null;
+  state.notes.clear();
+  state.labels = [];
+  state.selected.clear();
+  editor = null;
+  composer.expanded = false;
+  closePopover();
+  while (modals.length) { const m = modals.pop(); m.backdrop.remove(); }
+  document.body.classList.remove('modal-open', 'nav-open', 'selecting', 'searching');
+  $('#app').classList.add('hidden');
+  $('#login').classList.remove('hidden');
+  $('#login-user').focus();
+}
+app.showLogin = showLogin;
 
-  function showLogin() {
-    if (loginShown) return;
-    loginShown = true;
-    state.user = null;
-    state.notes = [];
-    state.labels = [];
-    editor = null;
-    composer.expanded = false;
-    composer.draft = null;
-    closePopover();
-    while (modals.length) modals.pop().backdrop.remove();
-    document.body.classList.remove('modal-open', 'nav-open');
-    $('#app').classList.add('hidden');
-    $('#login').classList.remove('hidden');
-    $('#login-user').focus();
-  }
+async function logout() {
+  try { await api('POST', 'api/logout', undefined, { auth: false }); } catch { /* egal */ }
+  showLogin();
+}
+app.logout = logout;
 
-  async function logout() {
-    try { await api('POST', '/api/logout', undefined, { auth: false }); } catch { /* egal */ }
+async function boot() {
+  try {
+    const me = await api('GET', 'api/me', undefined, { auth: false });
+    state.user = me;
+    state.settings = me.settings || {};
+    await showApp();
+  } catch (e) {
     showLogin();
+    if (e.status !== 401) $('#login-error').textContent = e.message;
   }
+}
 
-  async function boot() {
+app.labelChips = D.labelChips;
+app.labelPicker = D.labelPicker;
+app.palette = D.palette;
+
+function init() {
+  setIcon($('#menu-btn'), 'menu');
+  setIcon($('#search-icon'), 'search');
+  setIcon($('#search-clear'), 'close');
+  setIcon($('#refresh-btn'), 'refresh');
+  setIcon($('#settings-btn'), 'settings');
+  applyTheme();
+  darkMq.addEventListener('change', applyTheme);
+  // Auf Tablets standardmäßig nur die schmale Icon-Leiste zeigen (mehr Platz für Notizen)
+  document.body.classList.toggle('nav-collapsed', store.get('nav', window.innerWidth <= 1100 ? '1' : '0') === '1');
+
+  $('#login-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const err = $('#login-error');
+    const btn = $('#login-submit');
+    const username = $('#login-user').value.trim();
+    const password = $('#login-pass').value;
+    err.textContent = '';
+    if (!username || !password) { err.textContent = 'Bitte Benutzername und Passwort eingeben.'; return; }
+    btn.disabled = true;
     try {
-      state.user = await api('GET', '/api/me', undefined, { auth: false });
+      const me = await api('POST', 'api/login', { username, password }, { auth: false });
+      state.user = me;
+      state.settings = me.settings || {};
+      $('#login-pass').value = '';
       await showApp();
-    } catch (e) {
-      if (e.status !== 401) console.error(e);
-      showLogin();
-      if (e.status !== 401) $('#login-error').textContent = e.message;
+    } catch (e2) {
+      err.textContent = e2.message;
+      animate($('.login-card'), [{ transform: 'translateX(0)' }, { transform: 'translateX(-8px)' }, { transform: 'translateX(8px)' }, { transform: 'translateX(0)' }], { duration: 260 });
+    } finally {
+      btn.disabled = false;
     }
+  });
+
+  $('#menu-btn').addEventListener('click', () => {
+    if (isNarrow()) {
+      document.body.classList.toggle('nav-open');
+    } else {
+      const collapsed = !document.body.classList.contains('nav-collapsed');
+      store.set('nav', collapsed ? '1' : '0');
+      document.body.classList.toggle('nav-collapsed', collapsed);
+      setTimeout(renderMain, 220);
+    }
+  });
+  $('#sidebar-scrim').addEventListener('click', () => document.body.classList.remove('nav-open'));
+
+  const input = $('#search-input');
+  input.addEventListener('focus', enterSearch);
+  input.addEventListener('input', () => {
+    state.search = input.value;
+    $('#search-clear').classList.toggle('hidden', !state.search && !state.filter);
+    if (!state.searching) enterSearch(); else renderMain();
+  });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Backspace' && !input.value && state.filter) { state.filter = null; renderHeader(); renderMain(); }
+  });
+  $('#search-icon').addEventListener('click', () => { if (state.searching) exitSearch(); else input.focus(); });
+  $('#search-clear').addEventListener('click', () => {
+    input.value = '';
+    state.search = '';
+    state.filter = null;
+    renderHeader();
+    renderMain();
+    input.focus();
+  });
+
+  $('#refresh-btn').addEventListener('click', () => reloadAll(true));
+  $('#layout-btn').addEventListener('click', toggleLayout);
+  $('#settings-btn').addEventListener('click', e => openPopover(e.currentTarget, menu([
+    { label: 'Einstellungen', icon: 'settings', action: D.openSettings, hint: hintFor('settings') },
+    { label: document.documentElement.dataset.theme === 'dark' ? 'Helles Design aktivieren' : 'Dunkles Design aktivieren', icon: 'dark_mode', action: () => updateSettings({ theme: document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark' }) },
+    { label: 'Tastenkürzel', icon: 'keyboard', action: D.openShortcutHelp, hint: hintFor('help') },
+  ]), { align: 'end' }));
+  $('#account-btn').addEventListener('click', e => D.accountPopover(e.currentTarget));
+
+  // Klick außerhalb: zuerst Popover schließen, sonst Eingabefeld schließen (speichert die Notiz)
+  document.addEventListener('mousedown', e => {
+    const pop = $('#popover');
+    if (popoverOwner()) {
+      if (!pop.contains(e.target) && !popoverOwner().contains(e.target)) closePopover();
+      return;
+    }
+    if (composer.expanded && !$('#composer-wrap').contains(e.target) && !$('#modal-root').contains(e.target) && !$('#snackbar').contains(e.target)) {
+      closeComposer();
+    }
+    if (state.searching && !state.search && !state.filter && !$('#search').contains(e.target) && !$('#notes-area').contains(e.target) && !$('#modal-root').contains(e.target) && e.target.closest('#topbar, #main')) {
+      exitSearch();
+    }
+  }, true);
+
+  document.addEventListener('keydown', onGlobalKey, true);
+  window.addEventListener('hashchange', applyRoute);
+
+  // Kopfzeile: Schatten beim Scrollen, auf kleinen Bildschirmen beim Runterscrollen ausblenden
+  let lastY = 0;
+  window.addEventListener('scroll', () => {
+    const y = window.scrollY;
+    const bar = $('#topbar');
+    bar.classList.toggle('scrolled', y > 0);
+    if (window.innerWidth <= 600 && !state.selected.size) bar.classList.toggle('hide-up', y > lastY && y > 80);
+    else bar.classList.remove('hide-up');
+    lastY = y;
+  }, { passive: true });
+  let lastWidth = window.innerWidth;
+  window.addEventListener('resize', debounce(() => {
+    if (state.user && window.innerWidth !== lastWidth) renderMain();
+    lastWidth = window.innerWidth;
+    if (!isNarrow()) document.body.classList.remove('nav-open');
+  }, 120));
+  // Sichtbarer Bereich bei eingeblendeter Bildschirmtastatur (Mobilgeräte)
+  if (window.visualViewport) {
+    const setVh = () => document.documentElement.style.setProperty('--vvh', `${window.visualViewport.height}px`);
+    window.visualViewport.addEventListener('resize', setVh);
+    setVh();
   }
+  window.addEventListener('beforeunload', e => {
+    const pending = [...state.notes.values()].some(n => n.ns.pending());
+    if (pending || composer.expanded) { e.preventDefault(); e.returnValue = ''; }
+  });
+  boot();
+}
 
-  // ======================================================================
-  // Initialisierung & globale Ereignisse
-  // ======================================================================
-  function init() {
-    setIcon($('#menu-btn'), 'menu');
-    setIcon($('#search-icon'), 'search');
-    setIcon($('#search-clear'), 'close');
-    setIcon($('#refresh-btn'), 'refresh');
-    applyTheme();
-    document.body.classList.toggle('nav-collapsed', state.navCollapsed);
-    darkMq.addEventListener('change', applyTheme);
-
-    $('#login-form').addEventListener('submit', async e => {
-      e.preventDefault();
-      const err = $('#login-error');
-      const btn = $('#login-submit');
-      const username = $('#login-user').value.trim();
-      const password = $('#login-pass').value;
-      err.textContent = '';
-      if (!username || !password) { err.textContent = 'Bitte Benutzername und Passwort eingeben.'; return; }
-      btn.disabled = true;
-      try {
-        state.user = await api('POST', '/api/login', { username, password }, { auth: false });
-        $('#login-pass').value = '';
-        await showApp();
-      } catch (e2) {
-        err.textContent = e2.message;
-      } finally {
-        btn.disabled = false;
-      }
-    });
-
-    $('#menu-btn').addEventListener('click', () => {
-      if (isMobile()) {
-        document.body.classList.toggle('nav-open');
-      } else {
-        state.navCollapsed = !state.navCollapsed;
-        store.set('nav', state.navCollapsed ? '1' : '0');
-        document.body.classList.toggle('nav-collapsed', state.navCollapsed);
-        setTimeout(renderMain, 220); // Spaltenanzahl an neue Breite anpassen
-      }
-    });
-    $('#sidebar-scrim').addEventListener('click', () => document.body.classList.remove('nav-open'));
-
-    const searchInput = $('#search-input');
-    const clearSearch = () => {
-      searchInput.value = '';
-      state.search = '';
-      $('#search-clear').classList.add('hidden');
-      renderMain();
-    };
-    searchInput.addEventListener('input', () => {
-      state.search = searchInput.value;
-      $('#search-clear').classList.toggle('hidden', !state.search);
-      if (composer.expanded && state.search.trim()) closeComposer();
-      renderMain();
-    });
-    $('#search-icon').addEventListener('click', () => searchInput.focus());
-    $('#search-clear').addEventListener('click', () => { clearSearch(); searchInput.focus(); });
-
-    $('#refresh-btn').addEventListener('click', () => reload({ spin: true }));
-    $('#layout-btn').addEventListener('click', () => {
-      state.layout = state.layout === 'grid' ? 'list' : 'grid';
-      store.set('layout', state.layout);
-      renderHeader();
-      renderMain();
-    });
-    $('#theme-btn').addEventListener('click', cycleTheme);
-    $('#account-btn').addEventListener('click', e => openAccount(e.currentTarget));
-
-    // Klick außerhalb: zuerst Popover schließen, sonst Eingabefeld schließen (speichert die Notiz)
-    document.addEventListener('mousedown', e => {
-      const pop = $('#popover');
-      if (popOwner) {
-        if (!pop.contains(e.target) && !popOwner.contains(e.target)) closePopover();
-        return;
-      }
-      if (composer.expanded && !$('#composer-wrap').contains(e.target) && !$('#modal-root').contains(e.target)
-        && !$('#snackbar').contains(e.target)) {
-        closeComposer();
-      }
-    }, true);
-
-    document.addEventListener('keydown', e => {
-      if (e.key === 'Escape') {
-        if (popOwner) { closePopover(); return; }
-        if (modals.length) { modals[modals.length - 1].close(); return; }
-        if (composer.expanded) { closeComposer(); return; }
-        if (document.activeElement === searchInput && searchInput.value) clearSearch();
-        return;
-      }
-      const t = e.target;
-      if (!state.user || modals.length || e.ctrlKey || e.metaKey || e.altKey) return;
-      if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return;
-      const composerVisible = !$('#composer-wrap').classList.contains('hidden');
-      if (e.key === '/') { e.preventDefault(); searchInput.focus(); }
-      else if (e.key === 'c' && composerVisible) { e.preventDefault(); expandComposer(false); }
-      else if (e.key === 'l' && composerVisible) { e.preventDefault(); expandComposer(true); }
-    });
-
-    window.addEventListener('hashchange', applyRoute);
-    window.addEventListener('scroll', () => $('#topbar').classList.toggle('scrolled', window.scrollY > 0), { passive: true });
-    window.addEventListener('resize', debounce(() => {
-      if (state.user) renderMain();
-      if (!isMobile()) document.body.classList.remove('nav-open');
-    }, 120));
-    // Beim Zurückkehren in den Tab Änderungen von anderen Geräten laden
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible' && state.user && !editor && !composer.expanded && !modals.length) reload();
-    });
-
-    boot();
-  }
-
-  init();
-})();
+init();
+void hideToast;
+void rid;

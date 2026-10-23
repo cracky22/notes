@@ -100,7 +100,7 @@ export function labelChips(ids, onRemove, navigate = true) {
 }
 
 export async function createLabel(name) {
-  const lab = await api('POST', '/api/labels', { name });
+  const lab = await api('POST', 'api/labels', { name });
   state.labels.push(lab);
   app.render();
   return lab;
@@ -131,7 +131,7 @@ export function openLabelsDialog() {
         const name = input.value.trim();
         if (!name || name === lab.name) { input.value = lab.name; return; }
         try {
-          const upd = await api('PATCH', `/api/labels/${lab.id}`, { name });
+          const upd = await api('PATCH', `api/labels/${lab.id}`, { name });
           lab.name = upd.name;
           err.textContent = '';
           app.render();
@@ -145,7 +145,7 @@ export function openLabelsDialog() {
       const remove = async () => {
         if (!await confirmDialog('Dieses Label wird gelöscht und aus allen Notizen entfernt. Die Notizen selbst bleiben erhalten.', 'Löschen')) return;
         try {
-          await api('DELETE', `/api/labels/${lab.id}`);
+          await api('DELETE', `api/labels/${lab.id}`);
           state.labels = state.labels.filter(l => l !== lab);
           for (const n of state.notes.values()) n.labels = n.labels.filter(x => x !== lab.id);
           if (state.view === 'label' && state.labelId === lab.id) app.setView('notes');
@@ -175,7 +175,7 @@ export function openLabelsDialog() {
 // ---------------------------------------------------------------------------
 export async function openShareDialog(note, { onSave } = {}) {
   try {
-    const users = await api('GET', '/api/users');
+    const users = await api('GET', 'api/users');
     for (const u of users) state.users.set(u.id, u);
   } catch (e) { app.handleError(e); }
   const me = state.user;
@@ -227,7 +227,7 @@ export async function openShareDialog(note, { onSave } = {}) {
     const leaving = !isOwner && !members.some(x => x.id === me.id);
     if (leaving && !await confirmDialog('Du wirst als Mitbearbeiter entfernt und siehst diese Notiz nicht mehr.', 'Entfernen')) return;
     try {
-      const res = await api('PUT', `/api/notes/${note.id}/collaborators`, { user_ids: members.map(x => x.id) });
+      const res = await api('PUT', `api/notes/${note.id}/collaborators`, { user_ids: members.map(x => x.id) });
       m.close();
       if (res && res.left) app.removeNote(note.id, 'Du bist kein Mitbearbeiter dieser Notiz mehr');
       else if (res) app.upsertNote(res);
@@ -250,7 +250,7 @@ export async function openShareDialog(note, { onSave } = {}) {
 // ---------------------------------------------------------------------------
 export async function openVersions(note) {
   let versions;
-  try { versions = await api('GET', `/api/notes/${note.id}/versions`); } catch (e) { app.handleError(e); return; }
+  try { versions = await api('GET', `api/notes/${note.id}/versions`); } catch (e) { app.handleError(e); return; }
   const preview = h('div', { class: 'ver-preview', 'data-color': note.color || 'default' });
   const listEl = h('div', { class: 'ver-list', role: 'listbox', 'aria-label': 'Versionen' });
   const restoreBtn = h('button', { type: 'button', class: 'btn-primary' }, 'Wiederherstellen');
@@ -278,7 +278,7 @@ export async function openVersions(note) {
     restoreBtn.disabled = idx === 0;
     restoreBtn.textContent = idx === 0 ? 'Aktuelle Version' : 'Wiederherstellen';
     try {
-      if (!cache.has(v.id)) cache.set(v.id, await api('GET', `/api/notes/${note.id}/versions/${v.id}`));
+      if (!cache.has(v.id)) cache.set(v.id, await api('GET', `api/notes/${note.id}/versions/${v.id}`));
       if (current === v) showDoc(cache.get(v.id));
     } catch (e) { app.handleError(e); }
   };
@@ -291,7 +291,7 @@ export async function openVersions(note) {
   restoreBtn.addEventListener('click', async () => {
     if (!current) return;
     try {
-      await api('POST', `/api/notes/${note.id}/versions/${current.id}/restore`);
+      await api('POST', `api/notes/${note.id}/versions/${current.id}/restore`);
       m.close();
       toast(`Version vom ${fmtDate(current.updated_at)} wiederhergestellt`);
     } catch (e) { app.handleError(e); }
@@ -317,7 +317,7 @@ export function openLightbox(images, index, { onDelete } = {}) {
   const go = d => { i = (i + d + images.length) % images.length; show(); };
   const show = () => {
     const it = images[i];
-    img.src = it.url || `/api/images/${it.id}`;
+    img.src = it.url || `api/images/${it.id}`;
     counter.textContent = images.length > 1 ? `${i + 1} / ${images.length}` : '';
     prev.classList.toggle('hidden', images.length < 2);
     next.classList.toggle('hidden', images.length < 2);
@@ -454,7 +454,7 @@ export function openPasswordDialog() {
     err.textContent = '';
     if (newPw.value !== newPw2.value) { err.textContent = 'Die neuen Passwörter stimmen nicht überein.'; return; }
     try {
-      await api('POST', '/api/password', { old_password: oldPw.value, new_password: newPw.value });
+      await api('POST', 'api/password', { old_password: oldPw.value, new_password: newPw.value });
       m.close();
       toast('Passwort geändert. Andere Geräte wurden abgemeldet.');
     } catch (e2) { if (!(e2 instanceof AuthError)) err.textContent = e2.message; }

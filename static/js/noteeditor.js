@@ -778,7 +778,7 @@ export class NoteEditor {
     if (!imgs.length) return;
     this.imagesEl.dataset.count = String(Math.min(imgs.length, 6));
     imgs.forEach((img, idx) => {
-      const src = img.url || `/api/images/${img.id}`;
+      const src = img.url || `api/images/${img.id}`;
       const ratio = img.w && img.h ? img.w / img.h : 1.5;
       const tile = h('div', { class: 'ed-img' + (img.uploading ? ' uploading' : ''), style: { aspectRatio: imgs.length === 1 ? String(ratio) : '' } },
         h('img', { src, alt: '', loading: 'lazy', draggable: 'false', onclick: () => this.actions.viewImage && this.actions.viewImage(idx) }));

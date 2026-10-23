@@ -79,7 +79,7 @@ export function updateSettings(patch) {
   if (app.applySettings) app.applySettings();
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    api('PUT', '/api/me/settings', { settings: state.settings }).catch(e => app.handleError && app.handleError(e));
+    api('PUT', 'api/me/settings', { settings: state.settings }).catch(e => app.handleError && app.handleError(e));
   }, 300);
 }
 

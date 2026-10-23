@@ -155,7 +155,7 @@ export function userColor(user) {
 export function avatar(user, size = 32, cls = '') {
   const el = h('span', { class: `avatar ${cls}`.trim(), title: user.username, style: { width: `${size}px`, height: `${size}px`, fontSize: `${Math.round(size * 0.45)}px` } });
   if (user.avatar) {
-    el.append(h('img', { src: `/api/avatars/${user.id}?v=${user.avatar}`, alt: '', width: size, height: size, draggable: 'false' }));
+    el.append(h('img', { src: `api/avatars/${user.id}?v=${user.avatar}`, alt: '', width: size, height: size, draggable: 'false' }));
   } else {
     el.style.background = userColor(user);
     el.textContent = (user.username[0] || '?').toUpperCase();
