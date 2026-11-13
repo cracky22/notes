@@ -15,6 +15,28 @@ const META_KEYS = ['color', 'images', 'members', 'owner_id', 'role', 'pinned', '
   'trashed_at', 'labels', 'created_at', 'updated_at', 'updated_by'];
 const THEMES = { system: ['brightness_auto', 'Design: wie System'], light: ['light_mode', 'Design: hell'], dark: ['dark_mode', 'Design: dunkel'] };
 const URL_RE = /\bhttps?:\/\/\S+/i;
+const initialUrl = new URL(location.href);
+const initialHashParams = initialUrl.hash.startsWith('#?') ? new URLSearchParams(initialUrl.hash.slice(2)) : new URLSearchParams();
+let pairToken = initialUrl.searchParams.get('pair') || initialHashParams.get('pair');
+function consumeLoginParam(name) {
+  const u = new URL(location.href);
+  let value = u.searchParams.get(name);
+  if (value) {
+    u.searchParams.delete(name);
+    history.replaceState(null, '', u.pathname + u.search + u.hash);
+    return value;
+  }
+  if (u.hash.startsWith('#?')) {
+    const params = new URLSearchParams(u.hash.slice(2));
+    value = params.get(name);
+    if (value) {
+      params.delete(name);
+      const rest = params.toString();
+      history.replaceState(null, '', u.pathname + u.search + (rest ? `#?${rest}` : ''));
+    }
+  }
+  return value;
+}
 const isTouch = () => window.matchMedia('(pointer: coarse)').matches;
 const isNarrow = () => window.matchMedia('(max-width: 720px)').matches;
 
@@ -99,6 +121,7 @@ function upsertNote(view) {
       else n.ns.catchup();
     }
   }
+  if (activeLoadGeneration) n._loadedGeneration = activeLoadGeneration;
   for (const m of n.members || []) if (!state.users.has(m.id)) state.users.set(m.id, { id: m.id, username: m.username, avatar: m.avatar });
   if (editor && editor.note === n) {
     editor.ed.refreshMeta();
@@ -589,6 +612,25 @@ function imageGrid(images, cls) {
   return wrap;
 }
 
+function linkPreview(n) {
+  const text = noteText(n);
+  const match = text.match(/https?:\/\/[^\s<>"']+/i);
+  if (!match) return null;
+  const raw = match[0].replace(/[),.!?;:]+$/, '');
+  try {
+    const u = new URL(raw);
+    if (!['http:', 'https:'].includes(u.protocol)) return null;
+    const label = [u.hostname, u.pathname === '/' ? '' : u.pathname].join('');
+    const excerpt = text.replace(match[0], '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    return h('a', { class: 'link-preview', href: u.href, target: '_blank', rel: 'noopener noreferrer',
+      onclick: e => e.stopPropagation(), 'aria-label': `Linkvorschau: ${u.hostname}` },
+      h('span', { class: 'link-preview-icon' }, icon('link', 19)),
+      h('span', { class: 'link-preview-copy' }, h('strong', { text: u.hostname }),
+        h('span', { text: label }), excerpt ? h('small', { text: excerpt }) : null),
+      h('span', { class: 'link-preview-open', text: '↗' }));
+  } catch { return null; }
+}
+
 function buildCard(n, list) {
   const doc = n.ns.doc;
   const card = h('div', {
@@ -622,6 +664,8 @@ function buildCard(n, list) {
   } else if (!hasTitle && !n.images.length) {
     card.append(h('div', { class: 'note-body empty-note', text: 'Leere Notiz' }));
   }
+  const preview = linkPreview(n);
+  if (preview) card.append(preview);
   const chips = D.labelChips(n.labels, n.trashed ? null : id => patchNote(n, { labels: n.labels.filter(x => x !== id) }));
   const others = n.members.filter(m => m.id !== state.user.id);
   if (chips || others.length) {
@@ -1096,21 +1140,73 @@ async function fetchNote(id, reset = false) {
   }
 }
 
+let reloadGeneration = 0;
+let activeLoadGeneration = 0;
+function updateLoadProgress(loaded, total, waiting = false) {
+  const wrap = $('#load-progress');
+  if (!total || loaded >= total) { wrap.classList.add('hidden'); return; }
+  wrap.classList.remove('hidden');
+  $('#load-progress-text').textContent = waiting ? 'Verbindung schwach – Notizen werden weiter nachgeladen …' : 'Notizen werden nachgeladen …';
+  $('#load-progress-count').textContent = `${loaded} / ${total}`;
+  $('#load-progress-bar').style.width = `${Math.min(100, total ? loaded / total * 100 : 0)}%`;
+}
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 async function reloadAll(spin = false) {
+  const generation = ++reloadGeneration;
+  activeLoadGeneration = generation;
   const btn = $('#refresh-btn');
   if (spin) btn.classList.add('spin');
+  let loaded = 0, total = 0, complete = false;
   try {
-    const [notes, labels] = await Promise.all([api('GET', '/api/notes'), api('GET', '/api/labels')]);
+    const [first, labels] = await Promise.all([
+      api('GET', '/api/notes?offset=0&limit=60'), api('GET', '/api/labels'),
+    ]);
+    if (generation !== reloadGeneration) return;
     state.labels = labels;
-    const ids = new Set(notes.map(v => v.id));
-    for (const v of notes) upsertNote(v);
-    for (const id of [...state.notes.keys()]) if (!ids.has(id)) removeNote(id);
+    total = first.total;
+    for (const v of first.notes) upsertNote(v);
+    loaded = first.notes.length;
+    updateLoadProgress(loaded, total);
+    render();
+    let offset = first.next_offset;
+    let failures = 0;
+    while (offset !== null && generation === reloadGeneration) {
+      try {
+        const page = await api('GET', `/api/notes?offset=${offset}&limit=60`);
+        if (generation !== reloadGeneration) return;
+        for (const v of page.notes) upsertNote(v);
+        loaded += page.notes.length;
+        offset = page.next_offset;
+        failures = 0;
+        updateLoadProgress(loaded, total);
+      } catch (e) {
+        if (e instanceof AuthError) throw e;
+        failures++;
+        updateLoadProgress(loaded, total, true);
+        if (failures >= 6) throw e;
+        if (!navigator.onLine) {
+          await new Promise(resolve => window.addEventListener('online', resolve, { once: true }));
+        } else await wait(Math.min(1000 * 2 ** (failures - 1), 12000));
+      }
+    }
+    if (generation !== reloadGeneration) return;
+    // Reconcile only after the entire snapshot is loaded; partial data remains visible on errors.
+    const snapshotIds = new Set();
+    // Each loaded note is marked with the generation while iterating above.
+    for (const n of state.notes.values()) if (n._loadedGeneration === generation) snapshotIds.add(n.id);
+    for (const id of [...state.notes.keys()]) if (!snapshotIds.has(id)) removeNote(id);
+    complete = true;
+    updateLoadProgress(total, total);
     syncRoute();
     render();
   } catch (e) {
-    handleError(e);
+    if (!(e instanceof AuthError)) handleError(e);
+    if (total) updateLoadProgress(loaded, total, true);
   } finally {
+    if (activeLoadGeneration === generation) activeLoadGeneration = 0;
     if (spin) setTimeout(() => btn.classList.remove('spin'), 400);
+    if (complete) setTimeout(() => $('#load-progress').classList.add('hidden'), 500);
   }
 }
 
@@ -1125,6 +1221,19 @@ function onOpen() {
 // ===========================================================================
 // Anmeldung & Start
 // ===========================================================================
+async function approvePairIfPresent() {
+  if (!pairToken || !state.user) return;
+  const token = pairToken;
+  pairToken = null;
+  consumeLoginParam('pair');
+  try {
+    const ok = await confirmDialog('Dieses Gerät für die Anmeldung mit deinem Konto freigeben?', 'Gerät freigeben', 'Anmeldung bestätigen');
+    if (!ok) return;
+    await api('POST', '/api/device-login/approve', { challenge: token });
+    toast('Anmeldung freigegeben. Das neue Gerät wird angemeldet.');
+  } catch (e) { handleError(e); }
+}
+
 async function showApp() {
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
@@ -1178,14 +1287,18 @@ async function logout() {
 app.logout = logout;
 
 async function boot() {
+  const magic = consumeLoginParam('magic');
   try {
-    const me = await api('GET', '/api/me', undefined, { auth: false });
+    const me = magic
+      ? await api('POST', '/api/magic-links/redeem', { token: magic }, { auth: false })
+      : await api('GET', '/api/me', undefined, { auth: false });
     state.user = me;
     state.settings = me.settings || {};
     await showApp();
+    await approvePairIfPresent();
   } catch (e) {
     showLogin();
-    if (e.status !== 401) $('#login-error').textContent = e.message;
+    if (e.status !== 401 || magic) $('#login-error').textContent = e.message;
   }
 }
 
@@ -1219,6 +1332,7 @@ function init() {
       state.settings = me.settings || {};
       $('#login-pass').value = '';
       await showApp();
+      await approvePairIfPresent();
     } catch (e2) {
       err.textContent = e2.message;
       animate($('.login-card'), [{ transform: 'translateX(0)' }, { transform: 'translateX(-8px)' }, { transform: 'translateX(8px)' }, { transform: 'translateX(0)' }], { duration: 260 });
@@ -1227,6 +1341,7 @@ function init() {
     }
   });
 
+  $('#qr-login').addEventListener('click', () => D.openQrLogin());
   $('#menu-btn').addEventListener('click', () => {
     if (isNarrow()) {
       document.body.classList.toggle('nav-open');

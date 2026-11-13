@@ -85,6 +85,7 @@ Zufallsfällen.
 |---|---|
 | `python admin.py user add NAME` | Benutzer anlegen |
 | `python admin.py user list` | Benutzer mit eigenen/geteilten Notizen, Sitzungen, Profilbild |
+| `python admin.py user admin NAME` | Administratorrechte für die Web-Verwaltung vergeben (`--revoke` entzieht sie) |
 | `python admin.py user passwd NAME` | Passwort zurücksetzen (beendet alle Sitzungen) |
 | `python admin.py user delete NAME` | Benutzer inkl. eigener Notizen löschen |
 | `python admin.py user logout NAME` / `--all` | Sitzungen beenden |
@@ -101,6 +102,16 @@ Tägliches Backup per cron (behält die letzten 14):
 ```
 15 3 * * * cd /pfad/zu/notizen && .venv/bin/python admin.py backup create --keep 14
 ```
+
+## Neue Konto- und Verwaltungsfunktionen
+
+- Im Kontomenü werden belegter Speicher und ggf. das Kontingent lesbar angezeigt.
+- Geräteanmeldung per QR-Code ist nur nach ausdrücklicher Bestätigung auf einem bereits angemeldeten Gerät möglich.
+- Angemeldete Geräte können einzeln abgemeldet werden. Anmeldelinks laufen standardmäßig nach 30 Tagen ab und sind im Kontomenü widerrufbar; sie sind wie Passwörter zu behandeln.
+- Notizen werden in Seiten geladen; der erste Abschnitt erscheint sofort, weitere Seiten werden mit Fortschrittsanzeige nachgeladen.
+- Links in Notizen erhalten eine lokale Vorschau aus Domain, Pfad und Notizkontext. Es wird dafür keine externe Vorschau-/Tracking-Anfrage ausgelöst.
+- Administration unter `/notes/admin` (alternativ `/admin`). Nach dem ersten Benutzer `python admin.py user admin NAME` ausführen. Pro Nutzer kann dort ein Speicherkontingent gesetzt und der Verbrauch geprüft werden. Unbegrenzt bleibt der Standard. Das Dashboard zeigt zusätzlich die CPU-Momentaufnahme, Linux-Load-Averages für 1/5/15 Minuten, Host-RAM aus `/proc/meminfo` und nach Möglichkeit RAM/CPU-Zeit des `notizen.service` über `systemctl status notizen` bzw. `systemctl show`; wenn systemd-Werte fehlen, wird der Prozess-RSS als gekennzeichneter Fallback angezeigt. Diese Messwerte sind nur für Administratoren sichtbar.
+- Falls die Anwendung hinter einem Proxy-Prefix veröffentlicht wird, `NOTIZEN_PUBLIC_URL` auf die vollständige externe Basis-URL setzen, z. B. `https://example.org/notizen`. Die Apache-Regel muss `/notes/admin` an den Backend-Pfad `/admin` weiterleiten (statt auf `/notizen` umzuleiten); `/api/` und `/static/` müssen wie für die Anwendung üblich erreichbar bleiben.
 
 ## Sicherheit
 
@@ -124,4 +135,4 @@ Hinweis: Das ist Verschlüsselung „at rest“ – wer Datenbank **und** Schlü
 
 `NOTIZEN_DATA_DIR`, `NOTIZEN_DB`, `NOTIZEN_KEY_FILE`, `NOTIZEN_BACKUP_DIR`,
 `NOTIZEN_SESSION_DAYS` (Standard 30), `NOTIZEN_HOST`, `NOTIZEN_PORT`,
-`NOTIZEN_SECURE_COOKIE=1` (Secure-Cookie erzwingen).
+`NOTIZEN_SECURE_COOKIE=1` (Secure-Cookie erzwingen), `NOTIZEN_PUBLIC_URL` (öffentliche URL inkl. Proxy-Prefix für QR- und Anmeldelinks).

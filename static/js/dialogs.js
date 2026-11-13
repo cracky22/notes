@@ -463,18 +463,155 @@ export function openPasswordDialog() {
   oldPw.focus();
 }
 
+export function openQrLogin() {
+  let timer = null;
+  let challenge = null;
+  const status = h('p', { class: 'muted qr-status', text: 'Sichere Verbindung wird vorbereitet …', role: 'status', 'aria-live': 'polite' });
+  const image = h('img', { class: 'qr-image hidden', alt: 'QR-Code zur Geräteanmeldung' });
+  const content = h('div', { class: 'dialog qr-dialog' },
+    h('div', { class: 'ver-head' }, h('h3', { class: 'dialog-title', text: 'Mit Gerät anmelden' }),
+      iconBtn('close', 'Schließen', () => m.close())),
+    image,
+    status,
+    h('p', { class: 'muted', text: 'Scanne den Code mit einem bereits angemeldeten Gerät und bestätige die Anmeldung dort.' }),
+    h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'text-btn', onclick: () => m.close() }, 'Abbrechen')));
+  const m = openModal(content, { className: 'small', label: 'Mit Gerät anmelden', onClose: () => clearInterval(timer) });
+  (async () => {
+    try {
+      const data = await api('POST', '/api/device-login/challenge');
+      challenge = data.challenge;
+      image.src = `/api/device-login/qr?challenge=${encodeURIComponent(challenge)}`;
+      image.classList.remove('hidden');
+      status.textContent = 'Warte auf Bestätigung auf deinem anderen Gerät …';
+      timer = setInterval(async () => {
+        try {
+          const result = await api('POST', '/api/device-login/status', { challenge });
+          if (result.status === 'approved') {
+            clearInterval(timer);
+            m.close();
+            location.reload();
+          }
+        } catch (e) {
+          if (e.status === 410) {
+            clearInterval(timer);
+            status.textContent = 'Der QR-Code ist abgelaufen. Bitte starte die Anmeldung erneut.';
+          } else if (!(e instanceof AuthError)) status.textContent = 'Verbindung unterbrochen – Anmeldung wird weiter geprüft …';
+        }
+      }, 1400);
+    } catch (e) { status.textContent = e.message; }
+  })();
+}
+
+export async function openSessionsDialog() {
+  const rows = h('div', { class: 'session-list' });
+  const content = h('div', { class: 'dialog account-manage-dialog' },
+    h('div', { class: 'ver-head' }, h('h3', { class: 'dialog-title', text: 'Angemeldete Geräte' }),
+      iconBtn('close', 'Schließen', () => m.close())),
+    h('p', { class: 'muted', text: 'Beende Sitzungen auf Geräten, die du nicht mehr verwendest.' }),
+    rows,
+    h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'text-btn primary', onclick: () => m.close() }, 'Fertig')));
+  const m = openModal(content, { className: 'small', label: 'Angemeldete Geräte' });
+  rows.textContent = 'Lade Sitzungen …';
+  const draw = async () => {
+    try {
+      const sessions = await api('GET', '/api/me/sessions');
+      rows.replaceChildren();
+      if (!sessions.length) { rows.append(h('p', { class: 'muted', text: 'Keine aktiven Sitzungen.' })); return; }
+      for (const s of sessions) {
+        const label = s.current ? 'Dieses Gerät' : (s.user_agent || 'Unbekanntes Gerät').slice(0, 140);
+        const detail = s.current ? 'Aktuelle Sitzung' : `Zuletzt aktiv: ${s.last_seen ? fmtDateLong(s.last_seen) : 'unbekannt'}`;
+        const revoke = s.current ? null : h('button', { type: 'button', class: 'text-btn danger', onclick: async () => {
+          if (!await confirmDialog('Dieses Gerät abmelden?', 'Abmelden')) return;
+          try { await api('DELETE', `/api/me/sessions/${encodeURIComponent(s.id)}`); await draw(); }
+          catch (e) { toast(e.message); }
+        } }, 'Abmelden');
+        rows.append(h('div', { class: 'session-row' }, h('div', { class: 'session-copy' },
+          h('strong', { text: label }), h('small', { text: detail }),
+          h('small', { text: `Angemeldet: ${fmtDateLong(s.created_at)}` })), revoke));
+      }
+    } catch (e) { rows.replaceChildren(h('p', { class: 'form-error', text: e.message })); }
+  };
+  await draw();
+}
+
+export async function openMagicLinksDialog() {
+  const list = h('div', { class: 'magic-list' });
+  const create = h('button', { type: 'button', class: 'btn-primary', text: 'Anmeldelink erstellen' });
+  const content = h('div', { class: 'dialog account-manage-dialog' },
+    h('div', { class: 'ver-head' }, h('h3', { class: 'dialog-title', text: 'Anmeldelinks' }),
+      iconBtn('close', 'Schließen', () => m.close())),
+    h('p', { class: 'muted', text: 'Ein Link funktioniert wie ein Passwort. Teile ihn nur mit dir selbst und lösche ihn, sobald du ihn nicht mehr brauchst.' }),
+    list, create,
+    h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'text-btn primary', onclick: () => m.close() }, 'Fertig')));
+  const m = openModal(content, { className: 'small', label: 'Anmeldelinks' });
+  const draw = async () => {
+    list.replaceChildren();
+    try {
+      const links = await api('GET', '/api/magic-links');
+      if (!links.length) list.append(h('p', { class: 'muted', text: 'Noch keine Anmeldelinks.' }));
+      for (const item of links) list.append(h('div', { class: 'magic-row' },
+        h('div', { class: 'session-copy' }, h('strong', { text: item.label }),
+          h('small', { text: `Gültig bis ${fmtDateLong(item.expires_at)}` }),
+          h('small', { text: item.last_used_at ? `Zuletzt verwendet: ${fmtDateLong(item.last_used_at)}` : 'Noch nicht verwendet' })),
+        h('button', { type: 'button', class: 'text-btn danger', text: 'Löschen', onclick: async () => {
+          if (!await confirmDialog('Diesen Anmeldelink unwiderruflich löschen?', 'Löschen')) return;
+          try { await api('DELETE', `/api/magic-links/${item.id}`); await draw(); } catch (e) { toast(e.message); }
+        } })));
+    } catch (e) { list.append(h('p', { class: 'form-error', text: e.message })); }
+  };
+  create.addEventListener('click', async () => {
+    const label = prompt('Name für diesen Anmeldelink', 'Neues Gerät');
+    if (label === null) return;
+    try {
+      const item = await api('POST', '/api/magic-links', { label: label.trim() || 'Neues Gerät', days: 30 });
+      const field = h('input', { type: 'text', readonly: true, value: item.url, class: 'magic-url', 'aria-label': 'Neuer Anmeldelink' });
+      const copy = h('button', { type: 'button', class: 'text-btn primary', text: 'Link kopieren', onclick: async () => {
+        try { await navigator.clipboard.writeText(item.url); copy.textContent = 'Kopiert'; } catch { field.select(); document.execCommand('copy'); copy.textContent = 'Kopiert'; }
+      } });
+      openModal(h('div', { class: 'dialog' }, h('h3', { class: 'dialog-title', text: 'Link sicher aufbewahren' }),
+        h('p', { class: 'muted', text: 'Der Link wird nur jetzt vollständig angezeigt. Er ist 30 Tage gültig und gewährt direkten Kontozugriff.' }),
+        field, h('div', { class: 'dialog-actions' }, copy,
+          h('button', { type: 'button', class: 'text-btn', text: 'Schließen', onclick: () => { reveal.close(); draw(); } }))),
+        { className: 'small', label: 'Neuer Anmeldelink' });
+      const reveal = modals[modals.length - 1];
+      field.focus(); field.select();
+    } catch (e) { toast(e.message); }
+  });
+  await draw();
+}
+
 export function accountPopover(anchor) {
   const u = state.user;
   const big = avatar(u, 80, 'big');
   const cam = iconBtn('photo_camera', 'Profilbild ändern', () => { closePopover(); app.changeAvatar(); }, 'avatar-cam', 18);
+  const usage = h('div', { class: 'account-usage' }, h('span', { text: 'Speicherbelegung wird geladen …' }));
+  const items = [
+    { label: 'Profilbild ändern', icon: 'photo_camera', action: () => app.changeAvatar() },
+    u.avatar && { label: 'Profilbild entfernen', icon: 'delete', action: () => app.removeAvatar() },
+    { label: 'Angemeldete Geräte', icon: 'devices', action: openSessionsDialog },
+    { label: 'Anmeldelinks verwalten', icon: 'link', action: openMagicLinksDialog },
+    { label: 'Einstellungen', icon: 'settings', action: openSettings },
+    { label: 'Tastenkürzel', icon: 'keyboard', action: openShortcutHelp },
+    { label: 'Passwort ändern', icon: 'edit', action: openPasswordDialog },
+    u.is_admin && { label: 'Adminbereich', icon: 'settings', action: () => { location.href = '/notes/admin'; } },
+    { label: 'Abmelden', icon: 'arrow_back', action: () => app.logout() },
+  ];
   openPopover(anchor, h('div', { class: 'account-pop' },
     h('div', { class: 'account-head' }, h('div', { class: 'avatar-wrap' }, big, cam), h('div', { class: 'account-name', text: u.username })),
-    menu([
-      { label: 'Profilbild ändern', icon: 'photo_camera', action: () => app.changeAvatar() },
-      u.avatar && { label: 'Profilbild entfernen', icon: 'delete', action: () => app.removeAvatar() },
-      { label: 'Einstellungen', icon: 'settings', action: openSettings },
-      { label: 'Tastenkürzel', icon: 'keyboard', action: openShortcutHelp },
-      { label: 'Passwort ändern', icon: 'edit', action: openPasswordDialog },
-      { label: 'Abmelden', icon: 'arrow_back', action: () => app.logout() },
-    ])), { align: 'end' });
+    usage, menu(items)), { align: 'end' });
+  api('GET', '/api/me/usage').then(data => {
+    const used = formatBytes(data.used_bytes);
+    const limit = data.limit_bytes == null ? null : formatBytes(data.limit_bytes);
+    usage.replaceChildren(h('div', { class: 'usage-label' }, h('strong', { text: used }),
+      h('span', { text: limit ? `von ${limit}` : 'belegt' })),
+      data.limit_bytes != null ? h('div', { class: 'usage-track' }, h('span', { style: { width: `${Math.min(100, data.used_bytes / Math.max(1, data.limit_bytes) * 100)}%` } })) : null);
+  }).catch(() => { usage.textContent = 'Speicherbelegung nicht verfügbar'; });
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let n = bytes, i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toLocaleString('de-DE', { maximumFractionDigits: i ? 1 : 0 })} ${units[i]}`;
 }

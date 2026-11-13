@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import sys
+import subprocess
 import threading
 import time
 import uuid
@@ -31,7 +32,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response as FastAPIResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -142,6 +143,17 @@ class Hub:
         for conn in self.all_conns():
             if conn.open_note == note_id and conn is not exclude_conn:
                 conn.push(data)
+
+    def close_sessions(self, token_hashes) -> None:
+        hashes = set(token_hashes)
+        if not hashes or self.loop is None:
+            return
+        def close_now():
+            for c in list(self.all_conns()):
+                if c.token_hash in hashes:
+                    c.closed = True
+                    asyncio.create_task(c.ws.close(code=4401))
+        self.loop.call_soon_threadsafe(close_now)
 
 
 hub = Hub()
@@ -266,7 +278,7 @@ def _session_user(conn, token: str | None):
     if not token:
         return None
     return conn.execute(
-        "SELECT u.id, u.username, u.avatar_id, u.settings, s.token_hash FROM sessions s "
+        "SELECT u.id, u.username, u.avatar_id, u.settings, u.is_admin, u.storage_limit, s.token_hash FROM sessions s "
         "JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?",
         (_token_hash(token), core.now()),
     ).fetchone()
@@ -311,6 +323,23 @@ def _check_color(v):
 class LoginIn(BaseModel):
     username: str = Field(max_length=64)
     password: str = Field(max_length=core.MAX_PASSWORD_LEN)
+
+
+class MagicRedeemIn(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
+
+
+class MagicLinkIn(BaseModel):
+    label: str = Field(default="Dieses Gerät", min_length=1, max_length=80)
+    days: int = Field(default=30, ge=1, le=365)
+
+
+class DeviceChallengeIn(BaseModel):
+    challenge: str = Field(min_length=32, max_length=256)
+
+
+class AdminLimitIn(BaseModel):
+    storage_limit: int | None = Field(default=None, ge=0, le=10**13)
 
 
 class PasswordIn(BaseModel):
@@ -377,7 +406,7 @@ def participants(conn, note_id: int) -> list[int]:
     return [r[0] for r in conn.execute("SELECT user_id FROM note_users WHERE note_id = ?", (note_id,))]
 
 
-def note_views(conn, user_id: int, note_id: int | None = None) -> list[dict]:
+def note_views(conn, user_id: int, note_id: int | None = None, note_ids: list[int] | None = None) -> list[dict]:
     where, params = "nu.user_id = ?", [user_id]
     sub, sub_params = "SELECT note_id FROM note_users WHERE user_id = ?", [user_id]
     if note_id is not None:
@@ -385,6 +414,14 @@ def note_views(conn, user_id: int, note_id: int | None = None) -> list[dict]:
         params.append(note_id)
         sub += " AND note_id = ?"
         sub_params.append(note_id)
+    if note_ids is not None:
+        if not note_ids:
+            return []
+        marks = ",".join("?" for _ in note_ids)
+        where += f" AND n.id IN ({marks})"
+        params.extend(note_ids)
+        sub += f" AND note_id IN ({marks})"
+        sub_params.extend(note_ids)
     rows = conn.execute(
         f"SELECT n.*, nu.role, nu.pinned, nu.archived, nu.position FROM notes n "
         f"JOIN note_users nu ON nu.note_id = n.id WHERE {where}", params).fetchall()
@@ -490,11 +527,27 @@ def commit_change(conn, row, user_id: int, client: str, cid: str, change: list, 
     new_doc = ot.apply_change(doc, change)
     t = core.now()
     rev = row["rev"] + 1
+    new_payload = store_doc(new_doc)
+    owner = conn.execute("SELECT owner_id,payload FROM notes WHERE id=?", (row["id"],)).fetchone()
+    op_payload = keyring.encrypt(json.dumps(change, ensure_ascii=False, separators=(",", ":")))
+    last = conn.execute("SELECT payload,created_at,updated_at FROM note_versions WHERE note_id=? ORDER BY id DESC LIMIT 1",
+                        (row["id"],)).fetchone()
+    editors=[user_id]
+    if last and t-last["updated_at"] < core.VERSION_IDLE and t-last["created_at"] < core.VERSION_WINDOW:
+        editors=json.loads(keyring.decrypt(last["payload"])).get("editors",[])
+        if user_id not in editors: editors=editors+[user_id]
+        version_payload=store_doc({**new_doc,"editors":editors})
+        version_delta=len(version_payload.encode())-len(last["payload"].encode())
+    else:
+        version_payload=store_doc({**new_doc,"editors":editors})
+        version_delta=len(version_payload.encode())
+    growth=(len(new_payload.encode())-len(owner["payload"].encode())
+            +len(op_payload.encode())+version_delta)
+    enforce_quota(conn, owner["owner_id"], max(0,growth))
     conn.execute("UPDATE notes SET payload = ?, rev = ?, updated_at = ?, updated_by = ? WHERE id = ?",
-                 (store_doc(new_doc), rev, t, user_id, row["id"]))
+                 (new_payload, rev, t, user_id, row["id"]))
     conn.execute("INSERT INTO note_ops(note_id, rev, user_id, client, cid, created_at, op) VALUES (?,?,?,?,?,?,?)",
-                 (row["id"], rev, user_id, client, cid, t,
-                  keyring.encrypt(json.dumps(change, ensure_ascii=False, separators=(",", ":")))))
+                 (row["id"], rev, user_id, client, cid, t, op_payload))
     conn.execute("DELETE FROM note_ops WHERE note_id = ? AND rev <= ?", (row["id"], rev - core.OPLOG_KEEP))
     save_version(conn, row["id"], user_id, new_doc, t)
     return rev, new_doc
@@ -519,7 +572,31 @@ def me_view(row) -> dict:
         settings = json.loads(row["settings"] or "{}")
     except json.JSONDecodeError:
         settings = {}
-    return {"id": row["id"], "username": row["username"], "avatar": row["avatar_id"], "settings": settings}
+    return {"id": row["id"], "username": row["username"], "avatar": row["avatar_id"], "settings": settings,
+            "is_admin": bool(row["is_admin"]) if "is_admin" in row.keys() else False}
+
+
+def storage_usage(conn, user_id: int) -> int:
+    notes = conn.execute("SELECT COALESCE(SUM(length(CAST(payload AS BLOB))),0) FROM notes WHERE owner_id=?",
+                         (user_id,)).fetchone()[0]
+    ops = conn.execute("SELECT COALESCE(SUM(length(CAST(o.op AS BLOB))),0) FROM note_ops o "
+                       "JOIN notes n ON n.id=o.note_id WHERE n.owner_id=?", (user_id,)).fetchone()[0]
+    versions = conn.execute("SELECT COALESCE(SUM(length(CAST(v.payload AS BLOB))),0) FROM note_versions v "
+                            "JOIN notes n ON n.id=v.note_id WHERE n.owner_id=?", (user_id,)).fetchone()[0]
+    blobs = conn.execute("SELECT COALESCE(SUM(size),0) FROM blobs WHERE owner_id=?", (user_id,)).fetchone()[0]
+    return int(notes + ops + versions + blobs)
+
+
+def enforce_quota(conn, user_id: int, extra_bytes: int) -> None:
+    limit = conn.execute("SELECT storage_limit FROM users WHERE id=?", (user_id,)).fetchone()
+    if limit and limit[0] is not None and storage_usage(conn, user_id) + max(0, extra_bytes) > limit[0]:
+        raise HTTPException(413, "Speicherkontingent erreicht. Bitte Daten entfernen oder den Administrator kontaktieren.")
+
+
+def admin_user(user=Depends(current_user)):
+    if not user["is_admin"]:
+        raise HTTPException(403, "Administratorrechte erforderlich.")
+    return user
 
 
 @app.post("/api/login")
@@ -544,13 +621,160 @@ def login(body: LoginIn, request: Request, response: Response, conn=Depends(get_
 
     token = secrets.token_urlsafe(32)
     t = core.now()
-    conn.execute("INSERT INTO sessions(token_hash, user_id, created_at, expires_at) VALUES (?,?,?,?)",
-                 (_token_hash(token), row["id"], t, t + core.SESSION_DAYS * 86400))
+    token_hash = _token_hash(token)
+    conn.execute("INSERT INTO sessions(token_hash, user_id, created_at, expires_at, user_agent, last_seen) "
+                 "VALUES (?,?,?,?,?,?)", (token_hash, row["id"], t, t + core.SESSION_DAYS * 86400,
+                                            request.headers.get("user-agent", "")[:300], t))
     conn.execute("DELETE FROM sessions WHERE expires_at < ?", (t,))
     conn.commit()
     response.set_cookie(COOKIE_NAME, token, max_age=core.SESSION_DAYS * 86400, httponly=True,
                         samesite="strict", secure=_is_https(request), path="/")
     return me_view(row)
+
+
+@app.get("/api/me/usage")
+def me_usage(user=Depends(current_user), conn=Depends(get_db)):
+    return {"used_bytes": storage_usage(conn, user["id"]), "limit_bytes": user["storage_limit"]}
+
+
+@app.get("/api/me/sessions")
+def list_sessions(user=Depends(current_user), conn=Depends(get_db)):
+    rows = conn.execute("SELECT token_hash, created_at, expires_at, user_agent, last_seen FROM sessions "
+                        "WHERE user_id=? AND expires_at>? ORDER BY last_seen DESC", (user["id"], core.now())).fetchall()
+    return [{"id": r["token_hash"], "created_at": r["created_at"], "expires_at": r["expires_at"],
+             "last_seen": r["last_seen"], "user_agent": r["user_agent"],
+             "current": r["token_hash"] == user["token_hash"]} for r in rows]
+
+
+@app.delete("/api/me/sessions/{session_id}", status_code=204)
+def revoke_session(session_id: str, user=Depends(current_user), conn=Depends(get_db)):
+    row = conn.execute("SELECT token_hash FROM sessions WHERE user_id=? AND token_hash=?",
+                       (user["id"], session_id)).fetchone()
+    if not row:
+        raise HTTPException(404, "Sitzung nicht gefunden")
+    conn.execute("DELETE FROM sessions WHERE token_hash=?", (session_id,))
+    conn.commit()
+    hub.close_sessions([session_id])
+    return Response(status_code=204)
+
+
+@app.get("/api/magic-links")
+def list_magic_links(user=Depends(current_user), conn=Depends(get_db)):
+    return [dict(id=r["id"], label=r["label"], created_at=r["created_at"], expires_at=r["expires_at"],
+                 last_used_at=r["last_used_at"]) for r in conn.execute(
+        "SELECT id,label,created_at,expires_at,last_used_at FROM magic_links WHERE user_id=? ORDER BY id DESC",
+        (user["id"],))]
+
+
+@app.post("/api/magic-links", status_code=201)
+def create_magic_link(body: MagicLinkIn, request: Request, user=Depends(current_user), conn=Depends(get_db)):
+    token = secrets.token_urlsafe(40)
+    t = core.now()
+    cur = conn.execute("INSERT INTO magic_links(user_id,token_hash,label,created_at,expires_at) VALUES (?,?,?,?,?)",
+                       (user["id"], _token_hash(token), body.label.strip(), t, t + body.days * 86400))
+    conn.commit()
+    public = os.environ.get("NOTIZEN_PUBLIC_URL", str(request.base_url).rstrip("/"))
+    return {"id": cur.lastrowid, "token": token, "url": f"{public}/#?magic={token}",
+            "expires_at": t + body.days * 86400}
+
+
+@app.delete("/api/magic-links/{link_id}", status_code=204)
+def delete_magic_link(link_id: int, user=Depends(current_user), conn=Depends(get_db)):
+    conn.execute("DELETE FROM magic_links WHERE id=? AND user_id=?", (link_id, user["id"]))
+    conn.commit()
+    return Response(status_code=204)
+
+
+@app.post("/api/magic-links/redeem")
+def redeem_magic_link(body: MagicRedeemIn, request: Request, response: Response, conn=Depends(get_db)):
+    t = core.now()
+    row = conn.execute("SELECT u.*,m.id AS magic_id FROM magic_links m JOIN users u ON u.id=m.user_id "
+                       "WHERE m.token_hash=? AND m.expires_at>?", (_token_hash(body.token), t)).fetchone()
+    if not row:
+        raise HTTPException(401, "Anmeldelink ungültig oder abgelaufen.")
+    token = secrets.token_urlsafe(32)
+    token_hash = _token_hash(token)
+    conn.execute("INSERT INTO sessions(token_hash,user_id,created_at,expires_at,user_agent,last_seen) "
+                 "VALUES (?,?,?,?,?,?)", (token_hash,row["id"],t,t+core.SESSION_DAYS*86400,
+                                            request.headers.get("user-agent","")[:300],t))
+    conn.execute("UPDATE magic_links SET last_used_at=? WHERE id=?", (t,row["magic_id"]))
+    conn.commit()
+    response.set_cookie(COOKIE_NAME,token,max_age=core.SESSION_DAYS*86400,httponly=True,samesite="strict",
+                        secure=_is_https(request),path="/")
+    return me_view(row)
+
+
+@app.post("/api/device-login/challenge", status_code=201)
+def create_device_challenge(conn=Depends(get_db)):
+    token = secrets.token_urlsafe(40)
+    t = core.now()
+    conn.execute("DELETE FROM device_challenges WHERE expires_at<? OR consumed_at<?",(t,t-600))
+    conn.execute("INSERT INTO device_challenges(challenge_hash,created_at,expires_at) VALUES (?,?,?)",
+                 (_token_hash(token),t,t+180))
+    conn.commit()
+    return {"challenge":token,"expires_at":t+180}
+
+
+@app.get("/api/device-login/qr")
+def device_challenge_qr(challenge: str, request: Request, conn=Depends(get_db)):
+    if len(challenge) < 32 or len(challenge) > 256:
+        raise HTTPException(400,"Ungültige Anmeldung")
+    if not conn.execute("SELECT 1 FROM device_challenges WHERE challenge_hash=? AND expires_at>?",
+                        (_token_hash(challenge),core.now())).fetchone():
+        raise HTTPException(410,"Anmeldung abgelaufen.")
+    try:
+        import qrcode
+        import qrcode.image.svg
+        qr = qrcode.make(f"{os.environ.get('NOTIZEN_PUBLIC_URL', str(request.base_url).rstrip('/'))}/#?pair={challenge}",
+                         image_factory=qrcode.image.svg.SvgPathImage, box_size=5, border=3)
+        data = qr.to_string()
+    except ImportError as exc:
+        raise HTTPException(503,"QR-Code-Unterstützung fehlt (qrcode installieren).") from exc
+    return FastAPIResponse(data, media_type="image/svg+xml", headers={"Cache-Control":"no-store"})
+
+
+@app.post("/api/device-login/approve")
+def approve_device_login(body: DeviceChallengeIn, request: Request, user=Depends(current_user), conn=Depends(get_db)):
+    t=core.now(); ch=_token_hash(body.challenge)
+    row=conn.execute("SELECT * FROM device_challenges WHERE challenge_hash=? AND expires_at>? AND approved_user_id IS NULL",
+                     (ch,t)).fetchone()
+    if not row:
+        raise HTTPException(410,"Anmeldung abgelaufen oder bereits bestätigt.")
+    session=secrets.token_urlsafe(32); session_hash=_token_hash(session)
+    changed=conn.execute("UPDATE device_challenges SET approved_user_id=?,session_hash=?,session_token_enc=? "
+                         "WHERE challenge_hash=? AND expires_at>? AND approved_user_id IS NULL",
+                         (user["id"],session_hash,keyring.encrypt(session),ch,t)).rowcount
+    if changed != 1:
+        conn.rollback()
+        raise HTTPException(410,"Anmeldung abgelaufen oder bereits bestätigt.")
+    conn.execute("INSERT INTO sessions(token_hash,user_id,created_at,expires_at,user_agent,last_seen) "
+                 "VALUES (?,?,?,?,?,?)",(session_hash,user["id"],t,t+core.SESSION_DAYS*86400,
+                                          request.headers.get("user-agent","")[:300],t))
+    conn.commit()
+    return {"ok":True}
+
+
+@app.post("/api/device-login/status")
+def device_login_status(body: DeviceChallengeIn, request: Request, response: Response, conn=Depends(get_db)):
+    t=core.now(); ch=_token_hash(body.challenge)
+    row=conn.execute("SELECT * FROM device_challenges WHERE challenge_hash=?",(ch,)).fetchone()
+    if not row or row["expires_at"]<t:
+        raise HTTPException(410,"Anmeldung abgelaufen.")
+    if not row["approved_user_id"]:
+        return {"status":"pending"}
+    if row["consumed_at"]:
+        raise HTTPException(410,"Anmeldung wurde bereits verwendet.")
+    token=keyring.decrypt(row["session_token_enc"])
+    consumed=conn.execute("UPDATE device_challenges SET consumed_at=?,session_token_enc=NULL "
+                          "WHERE challenge_hash=? AND consumed_at IS NULL",(t,ch)).rowcount
+    if consumed != 1:
+        conn.rollback()
+        raise HTTPException(410,"Anmeldung wurde bereits verwendet.")
+    conn.commit()
+    user=conn.execute("SELECT * FROM users WHERE id=?",(row["approved_user_id"],)).fetchone()
+    response.set_cookie(COOKIE_NAME,token,max_age=core.SESSION_DAYS*86400,httponly=True,samesite="strict",
+                        secure=_is_https(request),path="/")
+    return {"status":"approved","user":me_view(user)}
 
 
 @app.post("/api/logout")
@@ -605,6 +829,8 @@ async def upload_avatar(request: Request, user=Depends(current_user), conn=Depen
         jpeg = await run_in_threadpool(core.process_avatar, data)
     except core.ImageError as exc:
         raise HTTPException(400, str(exc)) from exc
+    old_size=conn.execute("SELECT size FROM blobs WHERE id=? AND kind='avatar'",(user["avatar_id"],)).fetchone() if user["avatar_id"] else None
+    enforce_quota(conn,user["id"],len(jpeg)-(old_size[0] if old_size else 0))
     kid, blob = keyring.encrypt_bytes(jpeg)
     cur = conn.execute("INSERT INTO blobs(owner_id, note_id, kind, mime, width, height, size, key_id, data, "
                        "created_at) VALUES (?, NULL, 'avatar', 'image/jpeg', ?, ?, ?, ?, ?, ?)",
@@ -650,11 +876,24 @@ def list_users(_user=Depends(current_user), conn=Depends(get_db)):
 # Routen: Notizen
 # --------------------------------------------------------------------------- #
 @app.get("/api/notes")
-def list_notes(user=Depends(current_user), conn=Depends(get_db)):
+def list_notes(offset: int | None = None, limit: int = 80, user=Depends(current_user), conn=Depends(get_db)):
     conn.execute("DELETE FROM notes WHERE owner_id = ? AND trashed_at IS NOT NULL AND trashed_at < ?",
                  (user["id"], core.now() - core.TRASH_DAYS * 86400))
     conn.commit()
-    return note_views(conn, user["id"])
+    if offset is None:
+        return note_views(conn, user["id"])
+    if offset < 0 or limit < 1 or limit > 200:
+        raise HTTPException(400,"Ungültige Seitengröße")
+    uid=user["id"]
+    total=conn.execute("SELECT COUNT(*) FROM notes n JOIN note_users nu ON nu.note_id=n.id "
+                        "WHERE nu.user_id=? AND (n.trashed_at IS NULL OR nu.role='owner')",(uid,)).fetchone()[0]
+    ids=[r[0] for r in conn.execute("SELECT n.id FROM notes n JOIN note_users nu ON nu.note_id=n.id "
+          "WHERE nu.user_id=? AND (n.trashed_at IS NULL OR nu.role='owner') "
+          "ORDER BY nu.position DESC,n.id DESC LIMIT ? OFFSET ?",(uid,limit,offset)).fetchall()]
+    views=note_views(conn,uid,note_ids=ids)
+    by_id={v["id"]:v for v in views}
+    return {"notes":[by_id[i] for i in ids if i in by_id],"total":total,
+            "next_offset":offset+len(ids) if len(ids)==limit and offset+len(ids)<total else None}
 
 
 @app.get("/api/notes/{note_id}")
@@ -669,8 +908,11 @@ def create_note(body: NoteIn, request: Request, user=Depends(current_user), conn
     except ot.InvalidOp as exc:
         raise HTTPException(400, str(exc)) from exc
     uid, t = user["id"], core.now()
+    payload=store_doc(doc)
+    version_size=len(store_doc({**doc,"editors":[uid]}).encode())
+    enforce_quota(conn,uid,len(payload.encode())+version_size)
     cur = conn.execute("INSERT INTO notes(owner_id, payload, color, rev, created_at, updated_at, updated_by) "
-                       "VALUES (?,?,?,0,?,?,?)", (uid, store_doc(doc), body.color, t, t, uid))
+                       "VALUES (?,?,?,0,?,?,?)", (uid, payload, body.color, t, t, uid))
     nid = cur.lastrowid
     conn.execute("INSERT INTO note_users(note_id, user_id, role, pinned, archived, position, added_at) "
                  "VALUES (?,?,'owner',?,?,?,?)",
@@ -787,8 +1029,12 @@ def copy_note(note_id: int, request: Request, user=Depends(current_user), conn=D
     uid, t = user["id"], core.now()
     row = member_row(conn, uid, note_id)
     doc = load_doc(row)
+    payload=store_doc(doc)
+    copy_bytes=conn.execute("SELECT COALESCE(SUM(size),0) FROM blobs WHERE note_id=? AND kind='image'",(note_id,)).fetchone()[0]
+    version_size=len(store_doc({**doc,"editors":[uid]}).encode())
+    enforce_quota(conn,uid,len(payload.encode())+version_size+copy_bytes)
     cur = conn.execute("INSERT INTO notes(owner_id, payload, color, rev, created_at, updated_at, updated_by) "
-                       "VALUES (?,?,?,0,?,?,?)", (uid, store_doc(doc), row["color"], t, t, uid))
+                       "VALUES (?,?,?,0,?,?,?)", (uid, payload, row["color"], t, t, uid))
     nid = cur.lastrowid
     conn.execute("INSERT INTO note_users(note_id, user_id, role, position, added_at) VALUES (?,?,'owner',?,?)",
                  (nid, uid, next_position(conn, uid), t))
@@ -850,6 +1096,7 @@ async def upload_image(note_id: int, request: Request, user=Depends(current_user
         out, mime, w, h = await run_in_threadpool(core.process_image, data)
     except core.ImageError as exc:
         raise HTTPException(400, str(exc)) from exc
+    enforce_quota(conn,user["id"],len(out))
     kid, blob = keyring.encrypt_bytes(out)
     t = core.now()
     cur = conn.execute("INSERT INTO blobs(owner_id, note_id, kind, mime, width, height, size, key_id, data, "
@@ -994,6 +1241,171 @@ def delete_label(label_id: int, request: Request, user=Depends(current_user), co
 
 
 # --------------------------------------------------------------------------- #
+# Administrator: Kontingente, Verbrauch, Sitzungen
+# --------------------------------------------------------------------------- #
+def _host_memory() -> dict | None:
+    try:
+        values={}
+        with open("/proc/meminfo",encoding="ascii") as f:
+            for line in f:
+                key, value = line.split(":",1)
+                parts=value.split()
+                if parts and key in ("MemTotal","MemAvailable"):
+                    values[key]=int(parts[0])*1024
+        total=values.get("MemTotal")
+        available=values.get("MemAvailable")
+        if not total or available is None:
+            return None
+        used=max(0,total-available)
+        return {"total_bytes":total,"available_bytes":available,"used_bytes":used,
+                "used_percent":round(used/total*100,1)}
+    except (OSError,ValueError):
+        return None
+
+
+def _cpu_ticks() -> tuple[int,int] | None:
+    try:
+        with open("/proc/stat",encoding="ascii") as f:
+            fields=f.readline().split()
+        if not fields or fields[0] != "cpu":
+            return None
+        ticks=[int(x) for x in fields[1:]]
+        return sum(ticks), ticks[3]+(ticks[4] if len(ticks)>4 else 0)
+    except (OSError,ValueError,IndexError):
+        return None
+
+
+def _process_rss(pid: int | None) -> int | None:
+    target=pid or os.getpid()
+    try:
+        with open(f"/proc/{target}/status",encoding="ascii") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])*1024
+    except (OSError,ValueError,IndexError):
+        return None
+    return None
+
+
+def _systemd_service_metrics() -> dict:
+    unit="notizen.service"
+    status_text=""
+    status_ok=False
+    status_error=None
+    try:
+        result=subprocess.run(["systemctl","status","notizen","--no-pager","--full"],
+                             capture_output=True,text=True,timeout=3,check=False)
+        status_text=(result.stdout or "")+"\n"+(result.stderr or "")
+        status_ok=result.returncode in (0,3) and bool(status_text.strip())
+    except (OSError,subprocess.TimeoutExpired) as exc:
+        status_error="systemctl status notizen konnte nicht ausgeführt werden"
+
+    props={}
+    try:
+        result=subprocess.run(["systemctl","show",unit,"--no-pager",
+                               "--property=ActiveState,SubState,MainPID,MemoryCurrent,CPUUsageNSec,TasksCurrent"],
+                             capture_output=True,text=True,timeout=3,check=False)
+        for line in result.stdout.splitlines():
+            key,sep,value=line.partition("=")
+            if sep:
+                props[key]=value.strip()
+    except (OSError,subprocess.TimeoutExpired):
+        pass
+
+    memory=None
+    source=None
+    match=re.search(r"^\s*Memory:\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGTP]?)(?:i?B)?",status_text,re.I|re.M)
+    if match:
+        power={"":0,"K":1,"M":2,"G":3,"T":4,"P":5}[match.group(2).upper()]
+        memory=int(float(match.group(1))*(1024**power))
+        source="systemctl status notizen"
+    if memory is None:
+        try:
+            raw=props.get("MemoryCurrent","")
+            if raw.isdigit() and int(raw)<2**63-1:
+                memory=int(raw)
+                source="systemctl show (MemoryCurrent)"
+        except (ValueError,OverflowError):
+            pass
+    pid=int(props["MainPID"]) if props.get("MainPID","").isdigit() else None
+    if memory is None:
+        memory=_process_rss(pid)
+        if memory is not None:
+            source="Prozess-RSS (Fallback)"
+    cpu_ns=int(props["CPUUsageNSec"]) if props.get("CPUUsageNSec","").isdigit() else None
+    tasks=int(props["TasksCurrent"]) if props.get("TasksCurrent","").isdigit() else None
+    return {"unit":unit,"active_state":props.get("ActiveState"),"sub_state":props.get("SubState"),
+            "pid":pid,"memory_bytes":memory,"cpu_time_seconds":round(cpu_ns/1_000_000_000,1) if cpu_ns is not None else None,
+            "tasks":tasks,"source":source,"systemctl_status_ok":status_ok,
+            "error":status_error or (None if status_ok else "systemctl status notizen lieferte keinen lesbaren Dienststatus")}
+
+
+@app.get("/api/admin/metrics")
+def admin_metrics(_admin=Depends(admin_user)):
+    before=_cpu_ticks()
+    time.sleep(0.12)
+    after=_cpu_ticks()
+    cpu_percent=None
+    if before and after:
+        total=after[0]-before[0]
+        idle=after[1]-before[1]
+        if total>0:
+            cpu_percent=round(max(0,min(100,(total-idle)/total*100)),1)
+    try:
+        load_avg=list(os.getloadavg())
+    except (AttributeError,OSError):
+        load_avg=None
+    cores=os.cpu_count() or 1
+    return {"sampled_at":core.now(),"cpu":{"current_percent":cpu_percent,"cores":cores},
+            "load_avg":{"one":load_avg[0],"five":load_avg[1],"fifteen":load_avg[2]} if load_avg else None,
+            "host_memory":_host_memory(),"service":_systemd_service_metrics()}
+
+
+@app.get("/api/admin/users")
+def admin_list_users(_admin=Depends(admin_user), conn=Depends(get_db)):
+    out=[]
+    for r in conn.execute("SELECT id,username,is_admin,storage_limit,created_at FROM users ORDER BY username COLLATE NOCASE"):
+        note_count=conn.execute("SELECT COUNT(*) FROM notes WHERE owner_id=?",(r["id"],)).fetchone()[0]
+        out.append({"id":r["id"],"username":r["username"],"is_admin":bool(r["is_admin"]),
+                    "storage_limit":r["storage_limit"],"used_bytes":storage_usage(conn,r["id"]),
+                    "notes":note_count,"sessions":conn.execute("SELECT COUNT(*) FROM sessions WHERE user_id=? AND expires_at>?",
+                    (r["id"],core.now())).fetchone()[0]})
+    return out
+
+
+@app.patch("/api/admin/users/{user_id}")
+def admin_set_limit(user_id:int, body:AdminLimitIn, _admin=Depends(admin_user), conn=Depends(get_db)):
+    if not conn.execute("SELECT 1 FROM users WHERE id=?",(user_id,)).fetchone():
+        raise HTTPException(404,"Benutzer nicht gefunden")
+    conn.execute("UPDATE users SET storage_limit=? WHERE id=?",(body.storage_limit,user_id))
+    conn.commit()
+    return {"storage_limit":body.storage_limit}
+
+
+@app.get("/api/admin/users/{user_id}/sessions")
+def admin_sessions(user_id:int, _admin=Depends(admin_user), conn=Depends(get_db)):
+    if not conn.execute("SELECT 1 FROM users WHERE id=?",(user_id,)).fetchone():
+        raise HTTPException(404,"Benutzer nicht gefunden")
+    return [dict(id=r["token_hash"],created_at=r["created_at"],expires_at=r["expires_at"],
+                 last_seen=r["last_seen"],user_agent=r["user_agent"]) for r in conn.execute(
+        "SELECT token_hash,created_at,expires_at,last_seen,user_agent FROM sessions WHERE user_id=? ORDER BY last_seen DESC",
+        (user_id,))]
+
+
+@app.delete("/api/admin/users/{user_id}/sessions",status_code=204)
+def admin_revoke_sessions(user_id:int, _admin=Depends(admin_user), conn=Depends(get_db)):
+    hashes=[r[0] for r in conn.execute("SELECT token_hash FROM sessions WHERE user_id=?",(user_id,))]
+    conn.execute("DELETE FROM sessions WHERE user_id=?",(user_id,)); conn.commit(); hub.close_sessions(hashes)
+    return Response(status_code=204)
+
+
+@app.get("/admin", include_in_schema=False)
+@app.get("/notes/admin", include_in_schema=False)
+def admin_page():
+    return FileResponse(STATIC_DIR / "admin.html")
+
+
+# --------------------------------------------------------------------------- #
 # WebSocket: Befehle, Synchronisation, Live-Cursor
 # --------------------------------------------------------------------------- #
 def _process_op(conn_ws: Conn, note_id: int, base: int, cid: str, raw_change) -> tuple[list, list]:
@@ -1026,6 +1438,8 @@ def _process_op(conn_ws: Conn, note_id: int, base: int, cid: str, raw_change) ->
         except ot.InvalidOp as exc:
             log.warning("Ungültiger Befehl von %s für Notiz %s: %s", conn_ws.username, note_id, exc)
             return [{"t": "error", "id": note_id, "message": str(exc)}, {"t": "resync", "id": note_id}], []
+        except HTTPException as exc:
+            return [{"t":"error","id":note_id,"message":str(exc.detail)}], []
         db.commit()
         members = participants(db, note_id)
     finally:
@@ -1171,6 +1585,8 @@ async def websocket(ws: WebSocket):
                 if not valid:
                     await ws.close(code=4401)
                     break
+                db.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?",(core.now(),conn.token_hash))
+                db.commit()
                 conn.checked = time.monotonic()
             try:
                 msg = json.loads(text)
