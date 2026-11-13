@@ -633,6 +633,10 @@ body.selecting .card-toolbar { opacity: 0 !important; pointer-events: none; }
 .sc-label { flex: 1; min-width: 0; }
 .sc-keys { display: inline-flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
 .set-reset { padding: 12px 0 0; }
+.cache-help { margin: 6px 0 8px; line-height: 1.45; }
+.cache-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding-bottom: 8px; }
+.cache-status:empty { display: none; }
+.text-btn.danger { color: var(--error); }
 
 /* Tastenkürzel-Hilfe */
 .modal.help { width: min(860px, 100%); }

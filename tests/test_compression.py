@@ -69,9 +69,26 @@ def test_schema_v2_migrates_through_v5():
         conn.close()
 
 
+def test_schema_v5_adds_cache_generation():
+    conn=sqlite3.connect(':memory:')
+    conn.row_factory=sqlite3.Row
+    try:
+        conn.execute('CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        conn.execute('CREATE TABLE users(id INTEGER PRIMARY KEY, username TEXT NOT NULL)')
+        conn.execute("INSERT INTO meta(key,value) VALUES ('schema_version','5')")
+        conn.commit()
+        core._migrate_5_to_6(conn)
+        cols={r[1] for r in conn.execute('PRAGMA table_info(users)')}
+        assert 'cache_generation' in cols
+        assert core.schema_version(conn)==6
+    finally:
+        conn.close()
+
+
 if __name__=='__main__':
     test_payload_compression_roundtrip()
     test_compressed_text_survives_encryption()
     test_schema_v2_migrates_through_v5()
     test_schema_v4_creates_search_index_tables()
+    test_schema_v5_adds_cache_generation()
     print('Compression and schema migration tests OK')

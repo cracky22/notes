@@ -320,7 +320,13 @@ export function menu(items) {
 }
 
 let snackTimer = null;
+let snackbarsEnabled = true;
+export function setSnackbarsEnabled(enabled) {
+  snackbarsEnabled = !!enabled;
+  if (!snackbarsEnabled) hideToast();
+}
 export function toast(text, actionLabel, action) {
+  if (!snackbarsEnabled) return;
   const sb = document.getElementById('snackbar');
   sb.replaceChildren(h('span', { class: 'snack-text', text }));
   if (action) sb.append(h('button', { type: 'button', class: 'snack-action', onclick: () => { hideToast(); action(); } }, actionLabel));

@@ -68,6 +68,7 @@ export const DEFAULT_SETTINGS = {
   addItemsBottom: true,       // neue Listenelemente unten hinzufügen
   checkedBottom: true,        // abgehakte Elemente nach unten verschieben
   shortcutsEnabled: true,
+  snackbarsEnabled: true,      // nicht-kritische Status- und Erfolgsmeldungen
   shortcuts: {},              // Aktion → [Tastenkombinationen] (nur Abweichungen vom Standard)
 };
 
