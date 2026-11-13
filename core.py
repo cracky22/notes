@@ -52,7 +52,7 @@ VERSIONS_KEEP = 100       # maximale Anzahl Versionen je Notiz
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_SIDE = 2560
 AVATAR_SIDE = 256
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{3,64}$")
 MIN_PASSWORD_LEN = 8
@@ -83,18 +83,43 @@ CREATE TABLE IF NOT EXISTS users (
     created_at          INTEGER NOT NULL,
     password_changed_at INTEGER NOT NULL,
     settings            TEXT NOT NULL DEFAULT '{}',
-    avatar_id           INTEGER
+    avatar_id           INTEGER,
+    is_admin            INTEGER NOT NULL DEFAULT 0,
+    storage_limit       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash  TEXT PRIMARY KEY,
     user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at  INTEGER NOT NULL,
-    expires_at  INTEGER NOT NULL
+    expires_at  INTEGER NOT NULL,
+    user_agent  TEXT NOT NULL DEFAULT '',
+    last_seen   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
 -- payload = AES-256-GCM-verschlüsseltes JSON {"title","body","items","is_list"}
+CREATE TABLE IF NOT EXISTS magic_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash  TEXT NOT NULL UNIQUE,
+    label       TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    last_used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_magic_links_user ON magic_links(user_id);
+
+CREATE TABLE IF NOT EXISTS device_challenges (
+    challenge_hash TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    approved_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    session_hash TEXT,
+    session_token_enc TEXT,
+    consumed_at INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS notes (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -217,7 +242,11 @@ def prepare_db(conn: sqlite3.Connection, keyring: "KeyRing | None" = None) -> No
         target.close()
         os.chmod(backup, 0o600)
         print(f"Datenbank wird auf Schema v{SCHEMA_VERSION} aktualisiert (Sicherung: {backup}) …")
-        _migrate_1_to_2(conn, keyring)
+        if version == 1:
+            _migrate_1_to_2(conn, keyring)
+            version = 2
+        if version == 2:
+            _migrate_2_to_3(conn)
     elif version > SCHEMA_VERSION:
         raise RuntimeError("Die Datenbank stammt von einer neueren Programmversion.")
     try:
@@ -278,6 +307,30 @@ def _migrate_1_to_2(conn: sqlite3.Connection, keyring: "KeyRing") -> None:
     finally:
         conn.execute("PRAGMA foreign_keys = ON")
     print(f"Migration abgeschlossen: {len(members)} Notizen übernommen.")
+
+
+def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
+    conn.execute("BEGIN")
+    try:
+        user_cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+        if "is_admin" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+        if "storage_limit" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN storage_limit INTEGER")
+        session_cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+        if "user_agent" not in session_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''")
+        if "last_seen" not in session_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0")
+        for stmt in SCHEMA.split(";"):
+            if stmt.strip():
+                conn.execute(stmt)
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '3')")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    print("Migration auf Schema v3 abgeschlossen.")
 
 
 def key_ids_in_db(conn: sqlite3.Connection) -> dict[str, int]:

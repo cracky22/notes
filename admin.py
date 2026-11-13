@@ -172,6 +172,15 @@ def cmd_user_add(args) -> None:
     info(f"Benutzer '{name}' angelegt.")
 
 
+def cmd_user_admin(args) -> None:
+    conn = open_db()
+    user = get_user(conn, args.username)
+    enabled = not args.revoke
+    conn.execute("UPDATE users SET is_admin=? WHERE id=?", (int(enabled), user["id"]))
+    conn.commit()
+    info(f"Administratorrechte für '{user['username']}' {'erteilt' if enabled else 'entzogen'}.")
+
+
 def cmd_user_list(args) -> None:
     conn = open_db()
     rows = conn.execute(
@@ -505,6 +514,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("username")
     a.add_argument("--password-stdin", action="store_true", help="Passwort aus stdin lesen (Skripte)")
     a.set_defaults(func=cmd_user_add)
+    a = su.add_parser("admin", help="Administratorrechte vergeben oder entziehen")
+    a.add_argument("username")
+    a.add_argument("--revoke", action="store_true", help="Rechte entziehen")
+    a.set_defaults(func=cmd_user_admin)
     su.add_parser("list", help="Benutzer auflisten").set_defaults(func=cmd_user_list)
     a = su.add_parser("passwd", help="Passwort zurücksetzen")
     a.add_argument("username")

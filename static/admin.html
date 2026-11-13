@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f3f5f8">
+  <title>Notizen · Administration</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/admin.css">
+  <script type="module" src="/static/admin.js"></script>
+</head>
+<body class="admin-body">
+  <header class="admin-top"><a class="admin-brand" href="/">← Notizen</a><span>Administration</span><button id="refresh" class="text-btn">Aktualisieren</button></header>
+  <main class="admin-main">
+    <section class="admin-intro"><div><p class="eyebrow">VERWALTUNG</p><h1>Nutzung & Kontingente</h1><p>Speicherverbrauch pro Benutzer, aktive Sitzungen und Limits.</p></div><div class="admin-total" id="totals">Lade Daten …</div></section>
+    <section class="metrics-panel" aria-labelledby="metrics-title">
+      <div class="metrics-heading"><div><h2 id="metrics-title">Serverauslastung</h2><p>Aktuelle CPU-Stichprobe, Linux-Load-Average sowie Arbeitsspeicher des Hosts und des Dienstes.</p></div><span id="metrics-updated">Warte auf Messwerte …</span></div>
+      <div id="metrics-error" class="admin-error hidden" role="alert"></div>
+      <div id="metrics-grid" class="metrics-grid"><div class="metric-card metric-loading">Messwerte werden geladen …</div></div>
+      <p class="metrics-footnote">Load Average beschreibt die durchschnittliche Zahl ausführbarer bzw. wartender Prozesse, nicht direkt die CPU-Prozent-Auslastung. Die Prozentangabe je Kern ist eine Orientierung. Host-RAM stammt aus /proc/meminfo; Dienst-RAM wird, sofern verfügbar, mit <code>systemctl status notizen</code> ermittelt.</p>
+    </section>
+    <div id="error" class="admin-error hidden" role="alert"></div>
+    <div class="admin-table-wrap"><table><thead><tr><th>Benutzer</th><th>Notizen</th><th>Speicher belegt</th><th>Kontingent</th><th>Sitzungen</th><th></th></tr></thead><tbody id="users"><tr><td colspan="6">Lade Nutzer …</td></tr></tbody></table></div>
+    <p class="admin-note">Der Verbrauch umfasst eigene Notizen, Versionsverlauf, Bearbeitungsprotokolle sowie Bilder und Profilbilder des Nutzers. Ein leeres Kontingent bedeutet unbegrenzt.</p>
+  </main>
+  <div id="notice" class="admin-toast" role="status" aria-live="polite"></div>
+</body>
+</html>
