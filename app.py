@@ -21,7 +21,6 @@ import logging
 import os
 import re
 import secrets
-import sqlite3
 import sys
 import subprocess
 import threading
@@ -401,15 +400,6 @@ class DeviceChallengeIn(BaseModel):
 
 class AdminLimitIn(BaseModel):
     storage_limit: int | None = Field(default=None, ge=0, le=10**13)
-
-
-class AdminUserCreateIn(BaseModel):
-    username: str = Field(min_length=3, max_length=64)
-    password: str = Field(min_length=8, max_length=core.MAX_PASSWORD_LEN)
-
-
-class AdminPasswordResetIn(BaseModel):
-    new_password: str = Field(min_length=8, max_length=core.MAX_PASSWORD_LEN)
 
 
 class SearchQueryIn(BaseModel):
@@ -1623,50 +1613,6 @@ def admin_reset_search_index(user_id:int, _admin=Depends(admin_user), conn=Depen
     conn.commit()
     wake_indexer()
     return sidx.status(conn,user_id)
-
-
-@app.post("/api/admin/users", status_code=201)
-def admin_create_user(body:AdminUserCreateIn, _admin=Depends(admin_user), conn=Depends(get_db)):
-    try:
-        username=core.validate_username(body.username)
-        core.validate_password(body.password)
-    except ValueError as exc:
-        raise HTTPException(400,str(exc)) from exc
-    if conn.execute("SELECT 1 FROM users WHERE username=?",(username,)).fetchone():
-        raise HTTPException(409,"Dieser Benutzername ist bereits vergeben.")
-    t=core.now()
-    try:
-        cur=conn.execute("INSERT INTO users(username,password_hash,created_at,password_changed_at) VALUES (?,?,?,?)",
-                         (username,core.hash_password(body.password),t,t))
-    except sqlite3.IntegrityError as exc:
-        raise HTTPException(409,"Dieser Benutzername ist bereits vergeben.") from exc
-    conn.commit()
-    wake_indexer()
-    return {"id":cur.lastrowid,"username":username}
-
-
-@app.post("/api/admin/users/{user_id}/password")
-def admin_reset_user_password(user_id:int, body:AdminPasswordResetIn, _admin=Depends(admin_user), conn=Depends(get_db)):
-    row=conn.execute("SELECT username FROM users WHERE id=?",(user_id,)).fetchone()
-    if not row:
-        raise HTTPException(404,"Benutzer nicht gefunden")
-    try:
-        core.validate_password(body.new_password)
-    except ValueError as exc:
-        raise HTTPException(400,str(exc)) from exc
-    conn.execute("UPDATE users SET password_hash=?,password_changed_at=? WHERE id=?",
-                 (core.hash_password(body.new_password),core.now(),user_id))
-    if user_id==_admin["id"]:
-        hashes=[r[0] for r in conn.execute("SELECT token_hash FROM sessions WHERE user_id=? AND token_hash<>?",
-                                            (user_id,_admin["token_hash"]))]
-        conn.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?",(user_id,_admin["token_hash"]))
-    else:
-        hashes=[r[0] for r in conn.execute("SELECT token_hash FROM sessions WHERE user_id=?",(user_id,))]
-        conn.execute("DELETE FROM sessions WHERE user_id=?",(user_id,))
-    magic_links=conn.execute("DELETE FROM magic_links WHERE user_id=?",(user_id,)).rowcount
-    conn.commit()
-    hub.close_sessions(hashes)
-    return {"username":row["username"],"revoked_sessions":len(hashes),"revoked_magic_links":magic_links}
 
 
 @app.patch("/api/admin/users/{user_id}")
