@@ -9,8 +9,8 @@ const date = ts => ts ? new Date(ts * 1000).toLocaleString('de-DE') : '–';
 async function api(method, url, body) {
   const opts = {method, credentials:'same-origin', headers:{'X-Requested-With':'notizen'}};
   if (body !== undefined) { opts.headers['Content-Type']='application/json'; opts.body=JSON.stringify(body); }
-  const res = await fetch(url,opts);
-  if (res.status===401) { location.href='/'; throw new Error('Bitte zuerst anmelden.'); }
+  const res = await fetch(url.startsWith('/') ? url.slice(1) : url,opts);
+  if (res.status===401) { location.href='./'; throw new Error('Bitte zuerst anmelden.'); }
   if (!res.ok) { let d={}; try { d=await res.json(); } catch {} throw new Error(d.detail || `Fehler ${res.status}`); }
   return res.status===204 ? null : res.json();
 }

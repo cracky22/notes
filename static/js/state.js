@@ -41,7 +41,7 @@ export async function api(method, url, body, { auth = true, raw = false, content
     opts.body = JSON.stringify(body);
   }
   let res;
-  try { res = await fetch(url, opts); } catch { throw new Error('Keine Verbindung zum Server'); }
+  try { res = await fetch(url.startsWith('/') ? url.slice(1) : url, opts); } catch { throw new Error('Keine Verbindung zum Server'); }
   if (res.status === 401 && auth) {
     if (app.showLogin) app.showLogin();
     throw new AuthError('Nicht angemeldet');

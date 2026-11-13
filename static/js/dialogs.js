@@ -500,7 +500,7 @@ export function openQrLogin() {
     try {
       const data = await api('POST', '/api/device-login/challenge');
       challenge = data.challenge;
-      image.src = `/api/device-login/qr?challenge=${encodeURIComponent(challenge)}`;
+      image.src = `api/device-login/qr?challenge=${encodeURIComponent(challenge)}`;
       image.classList.remove('hidden');
       status.textContent = 'Warte auf Bestätigung auf deinem anderen Gerät …';
       timer = setInterval(async () => {
