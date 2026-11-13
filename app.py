@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import subprocess
 import threading
@@ -40,6 +41,7 @@ from pydantic import BaseModel, Field, field_validator
 
 import core
 import ot
+import search_index as sidx
 
 log = logging.getLogger("notizen")
 keyring = core.KeyRing(core.KEY_PATH)
@@ -190,19 +192,68 @@ def preflight() -> None:
               file=sys.stderr)
 
 
+# --------------------------------------------------------------------------- #
+# Suchindex-Worker: zieht geänderte Notizen nach und baut zurückgesetzte Indizes neu auf
+# --------------------------------------------------------------------------- #
+_index_wakeup: asyncio.Event | None = None
+_index_stop = threading.Event()
+
+
+def wake_indexer() -> None:
+    if hub.loop is not None and _index_wakeup is not None:
+        hub.loop.call_soon_threadsafe(_index_wakeup.set)
+
+
+def _index_housekeeping() -> int | None:
+    conn = core.connect()
+    try:
+        sidx.ensure_rows(conn, keyring)
+        conn.commit()
+        return sidx.next_pending_user(conn)
+    finally:
+        conn.close()
+
+
+async def index_worker() -> None:
+    global _index_wakeup
+    _index_wakeup = asyncio.Event()
+    while not _index_stop.is_set():
+        try:
+            while await run_in_threadpool(sidx.process_dirty, keyring) >= sidx.DIRTY_BATCH:
+                await asyncio.sleep(0)
+            uid = await run_in_threadpool(_index_housekeeping)
+            if uid is not None:
+                result = await run_in_threadpool(sidx.build_user, keyring, uid, _index_stop.is_set, 0.01)
+                log.info("Suchindex für Benutzer %s: %s", uid, result)
+                continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("Suchindex-Worker")
+        _index_wakeup.clear()
+        try:
+            await asyncio.wait_for(_index_wakeup.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     preflight()
     hub.loop = asyncio.get_running_loop()
+    _index_stop.clear()
     compressor = asyncio.create_task(compress_existing_archived_notes())
+    indexer = asyncio.create_task(index_worker())
     try:
         yield
     finally:
-        compressor.cancel()
-        try:
-            await compressor
-        except asyncio.CancelledError:
-            pass
+        _index_stop.set()
+        for task in (compressor, indexer):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Notizen", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -350,6 +401,19 @@ class DeviceChallengeIn(BaseModel):
 
 class AdminLimitIn(BaseModel):
     storage_limit: int | None = Field(default=None, ge=0, le=10**13)
+
+
+class AdminUserCreateIn(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=8, max_length=core.MAX_PASSWORD_LEN)
+
+
+class AdminPasswordResetIn(BaseModel):
+    new_password: str = Field(min_length=8, max_length=core.MAX_PASSWORD_LEN)
+
+
+class SearchQueryIn(BaseModel):
+    q: str = Field(default="", max_length=500)
 
 
 class PasswordIn(BaseModel):
@@ -675,6 +739,7 @@ def commit_change(conn, row, user_id: int, client: str, cid: str, change: list, 
                  (row["id"], rev, user_id, client, cid, t, op_payload))
     conn.execute("DELETE FROM note_ops WHERE note_id = ? AND rev <= ?", (row["id"], rev - core.OPLOG_KEEP))
     save_version(conn, row["id"], user_id, new_doc, t)
+    sidx.mark_dirty(conn, row["id"])
     return rev, new_doc
 
 
@@ -760,6 +825,41 @@ def login(body: LoginIn, request: Request, response: Response, conn=Depends(get_
 @app.get("/api/me/usage")
 def me_usage(user=Depends(current_user), conn=Depends(get_db)):
     return {"used_bytes": storage_usage(conn, user["id"]), "limit_bytes": user["storage_limit"]}
+
+
+# --------------------------------------------------------------------------- #
+# Routen: Suchindex
+# --------------------------------------------------------------------------- #
+@app.post("/api/search")
+def search_notes(body: SearchQueryIn, user=Depends(current_user), conn=Depends(get_db)):
+    """Serverseitige Volltextsuche über den eigenen Index (inkl. nicht geladener Archivnotizen)."""
+    q = body.q
+    st = sidx.status(conn, user["id"])
+    ids = sidx.search(conn, keyring, user["id"], q) if q.strip() else []
+    return {"state": st["state"], "ready": st["state"] == "ready", "done": st["done"], "total": st["total"],
+            "ids": ids}
+
+
+@app.get("/api/me/search-index")
+def my_search_index(user=Depends(current_user), conn=Depends(get_db)):
+    st = sidx.status(conn, user["id"])
+    if st["state"] == "error":
+        st["error"] = "Neuaufbau fehlgeschlagen. Bitte den Administrator kontaktieren."
+    return st
+
+
+@app.post("/api/me/search-index/rebuild")
+def rebuild_my_search_index(user=Depends(current_user), conn=Depends(get_db)):
+    st = sidx.status(conn, user["id"])
+    if st["state"] in ("pending", "building"):
+        return st
+    left = sidx.user_cooldown_left(conn, user["id"])
+    if left and st["state"] != "error":
+        raise HTTPException(429, f"Neuindizierung ist in {max(1, round(left / 60))} Min. wieder möglich.")
+    sidx.reset_user(conn, user["id"], "user", keyring)
+    conn.commit()
+    wake_indexer()
+    return sidx.status(conn, user["id"])
 
 
 @app.get("/api/me/sessions")
@@ -1054,7 +1154,9 @@ def create_note(body: NoteIn, request: Request, user=Depends(current_user), conn
         collab = set(found)
     sync_note_compression(conn,nid)
     save_version(conn, nid, uid, doc, t)
+    sidx.mark_dirty(conn, nid)
     conn.commit()
+    wake_indexer()
     publish_note(conn, nid, collab | {uid}, exclude_client=client_of(request))
     return one_view(conn, uid, nid)
 
@@ -1121,6 +1223,7 @@ def _remove_member(conn, note_id: int, user_id: int) -> None:
     conn.execute("DELETE FROM note_users WHERE note_id = ? AND user_id = ?", (note_id, user_id))
     conn.execute("DELETE FROM note_labels WHERE note_id = ? AND label_id IN "
                  "(SELECT id FROM labels WHERE user_id = ?)", (note_id, user_id))
+    sidx.drop_member(conn, note_id, user_id)
 
 
 @app.put("/api/notes/{note_id}/collaborators")
@@ -1147,7 +1250,11 @@ def set_collaborators(note_id: int, body: CollaboratorsIn, request: Request, use
     for other in removed:
         _remove_member(conn, note_id, other)
     sync_note_compression(conn,note_id)
+    if wanted - current:
+        sidx.mark_dirty(conn, note_id)   # neue Teilnehmer erhalten einen eigenen Indexeintrag
     conn.commit()
+    if wanted - current:
+        wake_indexer()
     publish_note(conn, note_id, current | wanted, exclude_client=client_of(request))
     if uid in removed:
         return {"left": True}
@@ -1174,7 +1281,9 @@ def copy_note(note_id: int, request: Request, user=Depends(current_user), conn=D
                  "SELECT ?, ?, kind, mime, width, height, size, key_id, data, ? FROM blobs "
                  "WHERE note_id = ? AND kind = 'image' ORDER BY id", (uid, nid, t, note_id))
     save_version(conn, nid, uid, doc, t)
+    sidx.mark_dirty(conn, nid)
     conn.commit()
+    wake_indexer()
     publish_note(conn, nid, [uid], exclude_client=client_of(request))
     return one_view(conn, uid, nid)
 
@@ -1494,13 +1603,70 @@ def admin_metrics(_admin=Depends(admin_user)):
 @app.get("/api/admin/users")
 def admin_list_users(_admin=Depends(admin_user), conn=Depends(get_db)):
     out=[]
+    index_status=sidx.all_status(conn)
     for r in conn.execute("SELECT id,username,is_admin,storage_limit,created_at FROM users ORDER BY username COLLATE NOCASE"):
         note_count=conn.execute("SELECT COUNT(*) FROM notes WHERE owner_id=?",(r["id"],)).fetchone()[0]
         out.append({"id":r["id"],"username":r["username"],"is_admin":bool(r["is_admin"]),
                     "storage_limit":r["storage_limit"],"used_bytes":storage_usage(conn,r["id"]),
                     "notes":note_count,"sessions":conn.execute("SELECT COUNT(*) FROM sessions WHERE user_id=? AND expires_at>?",
-                    (r["id"],core.now())).fetchone()[0]})
+                    (r["id"],core.now())).fetchone()[0],
+                    "search_index":index_status.get(r["id"],{"state":"pending","entries":0,"bytes":0,"done":0,"total":0,
+                                                              "built_at":None,"requested_at":None,"requested_by":None,"error":None})})
     return out
+
+
+@app.post("/api/admin/users/{user_id}/search-index/reset")
+def admin_reset_search_index(user_id:int, _admin=Depends(admin_user), conn=Depends(get_db)):
+    if not conn.execute("SELECT 1 FROM users WHERE id=?",(user_id,)).fetchone():
+        raise HTTPException(404,"Benutzer nicht gefunden")
+    sidx.reset_user(conn,user_id,"admin",keyring)
+    conn.commit()
+    wake_indexer()
+    return sidx.status(conn,user_id)
+
+
+@app.post("/api/admin/users", status_code=201)
+def admin_create_user(body:AdminUserCreateIn, _admin=Depends(admin_user), conn=Depends(get_db)):
+    try:
+        username=core.validate_username(body.username)
+        core.validate_password(body.password)
+    except ValueError as exc:
+        raise HTTPException(400,str(exc)) from exc
+    if conn.execute("SELECT 1 FROM users WHERE username=?",(username,)).fetchone():
+        raise HTTPException(409,"Dieser Benutzername ist bereits vergeben.")
+    t=core.now()
+    try:
+        cur=conn.execute("INSERT INTO users(username,password_hash,created_at,password_changed_at) VALUES (?,?,?,?)",
+                         (username,core.hash_password(body.password),t,t))
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409,"Dieser Benutzername ist bereits vergeben.") from exc
+    conn.commit()
+    wake_indexer()
+    return {"id":cur.lastrowid,"username":username}
+
+
+@app.post("/api/admin/users/{user_id}/password")
+def admin_reset_user_password(user_id:int, body:AdminPasswordResetIn, _admin=Depends(admin_user), conn=Depends(get_db)):
+    row=conn.execute("SELECT username FROM users WHERE id=?",(user_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Benutzer nicht gefunden")
+    try:
+        core.validate_password(body.new_password)
+    except ValueError as exc:
+        raise HTTPException(400,str(exc)) from exc
+    conn.execute("UPDATE users SET password_hash=?,password_changed_at=? WHERE id=?",
+                 (core.hash_password(body.new_password),core.now(),user_id))
+    if user_id==_admin["id"]:
+        hashes=[r[0] for r in conn.execute("SELECT token_hash FROM sessions WHERE user_id=? AND token_hash<>?",
+                                            (user_id,_admin["token_hash"]))]
+        conn.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?",(user_id,_admin["token_hash"]))
+    else:
+        hashes=[r[0] for r in conn.execute("SELECT token_hash FROM sessions WHERE user_id=?",(user_id,))]
+        conn.execute("DELETE FROM sessions WHERE user_id=?",(user_id,))
+    magic_links=conn.execute("DELETE FROM magic_links WHERE user_id=?",(user_id,)).rowcount
+    conn.commit()
+    hub.close_sessions(hashes)
+    return {"username":row["username"],"revoked_sessions":len(hashes),"revoked_magic_links":magic_links}
 
 
 @app.patch("/api/admin/users/{user_id}")

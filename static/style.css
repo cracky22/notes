@@ -794,3 +794,10 @@ body.selecting .card-toolbar { opacity: 0 !important; pointer-events: none; }
 /* ---------- Archivierte Notizen: Inhalt bei Bedarf nachladen ---------- */
 .deferred-note { min-height:58px; display:flex; align-items:center; padding:14px 12px; color:var(--fg-2); font-size:13px; border-top:1px solid var(--border); }
 .archive-load-notice { max-width:760px; margin:0 auto 14px; padding:10px 14px; color:var(--fg-2); font-size:13px; background:var(--hover-soft); border-radius:6px; }
+
+.account-index { margin:0 16px 8px; padding:10px 12px; border-radius:8px; background:var(--hover-soft); font-size:12px; color:var(--fg-2); }
+.account-index .index-label { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.account-index .index-label strong { font-size:13px; color:var(--fg); }
+.account-index .index-label .text-btn { padding:4px 8px; font-size:12px; }
+.account-index .index-detail { margin-top:2px; }
+.account-index .usage-track { margin-top:7px; }

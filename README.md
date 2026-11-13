@@ -12,9 +12,10 @@ notizen/
 ├── app.py            Webserver (FastAPI + WebSocket, direkt startbar)
 ├── admin.py          Verwaltungsprogramm (Benutzer, Schlüssel, Backups)
 ├── core.py           Datenbank, Migration, Verschlüsselung, Passwörter, Bildverarbeitung
+├── search_index.py   Getrennte, verschlüsselte Suchindizes je Benutzer
 ├── ot.py             Operational Transformation (konfliktfreie Zusammenarbeit)
 ├── requirements.txt
-├── tests/test_ot.py  Selbsttest der Konfliktfreiheit
+├── tests/            Tests für Konfliktfreiheit, Kompression, Migration und Suchindex
 └── static/           Frontend ohne externe Abhängigkeiten
     ├── index.html, style.css, logo.svg
     └── js/  app.js · noteeditor.js · editor.js · delta.js · sync.js · dialogs.js · dom.js · state.js
@@ -46,9 +47,8 @@ Im ganzen Netzwerk erreichbar: `python app.py --host 0.0.0.0 --port 8000`.
 Für den Zugriff über das Internet einen Reverse-Proxy mit HTTPS davorschalten, der WebSockets
 durchreicht (z. B. Caddy: `caddy reverse-proxy --from notizen.example.de --to 127.0.0.1:8000`).
 
-**Update von der ersten Version:** Einfach die neuen Dateien einspielen und starten – die
-Datenbank wird automatisch auf Schema v2 migriert, vorher wird unter `data/backups/` eine
-Sicherung angelegt.
+**Update:** Neue Dateien einspielen und starten. Die Datenbank wird automatisch auf das aktuelle
+Schema migriert; vor einer Migration wird unter `data/backups/` eine Sicherung angelegt.
 
 ## Funktionen im Überblick
 
@@ -59,6 +59,7 @@ Sicherung angelegt.
 | Bilder | Bildsymbol, Einfügen aus der Zwischenablage oder Drag & Drop; Klick öffnet die Großansicht |
 | Mehrfachauswahl | Häkchen oben links auf der Karte (beim Überfahren), Umschalt+Klick wählt Bereiche |
 | Suche | Klick ins Suchfeld zeigt Typen (Listen, Bilder, Links, Geteilt), Labels, Dinge (Bücher, Essen, Reisen …) und Farben |
+| Suchindex | Volltextsuche läuft über einen invertierten Index mit eigenem Bereich je Benutzer. Notizwortlisten und nutzerspezifische HMAC-Schlüssel sind AES-verschlüsselt; die Terme selbst werden nur als HMAC-Prüfsummen gespeichert. Der Server baut den Index beim Start im Hintergrund auf und hält Änderungen laufend nach. Im Kontomenü kann der eigene Index neu aufgebaut werden (höchstens alle 10 Minuten); Admins können den Index je Benutzer im Adminpanel zurücksetzen. Ein Reset löscht den bisherigen Index und startet den Neuaufbau. |
 | Versionsverlauf | ⋮ → Versionsverlauf: Bearbeitungssitzungen mit Bearbeitern, Vorschau, Wiederherstellen |
 | Tastenkürzel | `?` zeigt alle, Zahnrad → Einstellungen zum Umbelegen (wird pro Benutzer gespeichert) |
 | Profilbild | Avatar oben rechts → Profilbild ändern (JPG/PNG/WebP, wird quadratisch auf 256 px skaliert) |
@@ -78,6 +79,8 @@ Teilnehmer garantiert beim identischen Ergebnis, ohne Sperren und ohne Mergekonf
 Verbindungsabbrüche werden abgefangen: Änderungen bleiben im Browser vorgemerkt und werden nach
 der Wiederverbindung nachgereicht. `python tests/test_ot.py` prüft die Konvergenz mit 5000
 Zufallsfällen.
+Die Kompressions-/Migrationstests laufen mit `python tests/test_compression.py`, der Suchindex mit
+`python tests/test_search_index.py`.
 
 ## Verwaltungsprogramm
 
@@ -90,7 +93,7 @@ Zufallsfällen.
 | `python admin.py user delete NAME` | Benutzer inkl. eigener Notizen löschen |
 | `python admin.py user logout NAME` / `--all` | Sitzungen beenden |
 | `python admin.py key status` | Schlüsselring, Fingerabdrücke, Datensätze je Schlüssel |
-| `python admin.py key rotate` | neuen Master-Schlüssel erzeugen, alles umschlüsseln (Notizen, Bilder, Verlauf, Protokoll) |
+| `python admin.py key rotate` | neuen Master-Schlüssel erzeugen, alles umschlüsseln (Notizen, Bilder, Verlauf, Protokoll, verschlüsselter Suchindex-Schlüssel) |
 | `python admin.py key export DATEI` | Schlüsselring exportieren (separat sichern!) |
 | `python admin.py key import DATEI` | Schlüssel einspielen (z. B. für alte Backups) |
 | `python admin.py backup create [--include-key] [--keep N]` | Backup als ZIP (läuft auch bei laufendem Server) |
@@ -108,9 +111,10 @@ Tägliches Backup per cron (behält die letzten 14):
 - Im Kontomenü werden belegter Speicher und ggf. das Kontingent lesbar angezeigt.
 - Geräteanmeldung per QR-Code ist nur nach ausdrücklicher Bestätigung auf einem bereits angemeldeten Gerät möglich.
 - Angemeldete Geräte können einzeln abgemeldet werden. Anmeldelinks laufen standardmäßig nach 30 Tagen ab und sind im Kontomenü widerrufbar; sie sind wie Passwörter zu behandeln.
-- Notizen werden in Seiten geladen; der erste Abschnitt erscheint sofort, weitere Seiten werden mit Fortschrittsanzeige nachgeladen. Archivierte Notizinhalte werden erst beim Anzeigen bzw. beim Suchen nachgeladen. Ist eine Notiz bei allen Beteiligten archiviert, komprimiert der Server Inhalt und Versionsstände vor der bestehenden AES-Verschlüsselung (nur wenn die Kompression mindestens 5 % spart). Beim Öffnen oder Bearbeiten entpackt der Server sie transparent; beim Speichern wird sie wieder komprimiert. Wird die Notiz von einer Person entarchiviert oder ein aktiver Mitbearbeiter hinzugefügt, wird der aktuelle Inhalt wieder unkomprimiert gespeichert, sofern das Kompressionskriterium dann nicht mehr erfüllt ist. Bereits vorhandene passende Notizen komprimiert der Server nach dem Update schrittweise im Hintergrund.
+- Der Suchindex liegt in eigenen Datenbankeinträgen pro Nutzer; Notizwortlisten und nutzerspezifische HMAC-Schlüssel werden wie Notizinhalte AES-verschlüsselt gespeichert, Terme sind als HMAC-Prüfsummen abgelegt. Jede geteilte Notiz wird separat in den Indizes der jeweiligen Teilnehmer geführt. Bei einem Neuaufbau wird der bisherige Nutzerindex gelöscht und im Hintergrund stapelweise neu erzeugt; der Fortschritt ist im Profil und im Adminpanel sichtbar. Suchbegriffe werden serverseitig gegen den Index geprüft, sodass auch Archivnotizen gefunden werden, ohne ihren vollständigen Text zuerst in den Browser zu laden.
+- Notizen werden in Seiten geladen; der erste Abschnitt erscheint sofort, weitere Seiten werden mit Fortschrittsanzeige nachgeladen. Archivierte Notizinhalte werden erst beim Anzeigen nachgeladen; bei einem noch nicht fertigen Index wird die Suche vorübergehend per Direktladen der Archivnotizen abgesichert. Ist eine Notiz bei allen Beteiligten archiviert, komprimiert der Server Inhalt und Versionsstände vor der bestehenden AES-Verschlüsselung (nur wenn die Kompression mindestens 5 % spart). Beim Öffnen oder Bearbeiten entpackt der Server sie transparent; beim Speichern wird sie wieder komprimiert. Wird die Notiz von einer Person entarchiviert oder ein aktiver Mitbearbeiter hinzugefügt, wird der aktuelle Inhalt wieder unkomprimiert gespeichert, sofern das Kompressionskriterium dann nicht mehr erfüllt ist. Bereits vorhandene passende Notizen komprimiert der Server nach dem Update schrittweise im Hintergrund.
 - Links in Notizen erhalten eine lokale Vorschau aus Domain, Pfad und Notizkontext. Es wird dafür keine externe Vorschau-/Tracking-Anfrage ausgelöst.
-- Administration unter `/notes/admin` (alternativ `/admin`). Nach dem ersten Benutzer `python admin.py user admin NAME` ausführen. Pro Nutzer kann dort ein Speicherkontingent gesetzt und der Verbrauch geprüft werden. Unbegrenzt bleibt der Standard. Das Dashboard zeigt zusätzlich die CPU-Momentaufnahme, Linux-Load-Averages für 1/5/15 Minuten, Host-RAM aus `/proc/meminfo` und nach Möglichkeit RAM/CPU-Zeit des `notizen.service` über `systemctl status notizen` bzw. `systemctl show`; wenn systemd-Werte fehlen, wird der Prozess-RSS als gekennzeichneter Fallback angezeigt. Diese Messwerte sind nur für Administratoren sichtbar.
+- Administration unter `/notes/admin` (alternativ `/admin`). Admins können dort normale Nutzerkonten anlegen und deren Passwort zurücksetzen; dabei werden Sitzungen und vorhandene Anmeldelinks dieses Kontos widerrufen. Das eigene aktive Admin-Gerät bleibt beim Zurücksetzen des eigenen Passworts angemeldet. Nach dem ersten Benutzer `python admin.py user admin NAME` ausführen. Pro Nutzer kann dort ein Speicherkontingent gesetzt und der Verbrauch geprüft werden. Unbegrenzt bleibt der Standard. Das Dashboard zeigt zusätzlich die CPU-Momentaufnahme, Linux-Load-Averages für 1/5/15 Minuten, Host-RAM aus `/proc/meminfo` und nach Möglichkeit RAM/CPU-Zeit des `notizen.service` über `systemctl status notizen` bzw. `systemctl show`; wenn systemd-Werte fehlen, wird der Prozess-RSS als gekennzeichneter Fallback angezeigt. Diese Messwerte sind nur für Administratoren sichtbar.
 - Falls die Anwendung hinter einem Proxy-Prefix veröffentlicht wird, `NOTIZEN_PUBLIC_URL` auf die vollständige externe Basis-URL setzen, z. B. `https://example.org/notizen`. Die Apache-Regel muss `/notes/admin` an den Backend-Pfad `/admin` weiterleiten (statt auf `/notizen` umzuleiten); `/api/` und `/static/` müssen wie für die Anwendung üblich erreichbar bleiben.
 
 ## Sicherheit
