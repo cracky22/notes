@@ -698,7 +698,7 @@ function imageGrid(images, cls) {
   for (const img of shown) {
     const ratio = img.w && img.h ? img.w / img.h : 4 / 3;
     wrap.append(h('div', { class: 'img-tile' + (img.uploading ? ' uploading' : ''), style: { aspectRatio: shown.length === 1 ? String(Math.max(0.5, Math.min(ratio, 3))) : '' } },
-      h('img', { src: img.url || `/api/images/${img.id}`, alt: '', loading: 'lazy', draggable: 'false' })));
+      h('img', { src: img.url || `api/images/${img.id}`, alt: '', loading: 'lazy', draggable: 'false' })));
   }
   return wrap;
 }
