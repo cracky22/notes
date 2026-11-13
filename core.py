@@ -53,7 +53,7 @@ VERSIONS_KEEP = 100       # maximale Anzahl Versionen je Notiz
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_SIDE = 2560
 AVATAR_SIDE = 256
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{3,64}$")
 MIN_PASSWORD_LEN = 8
@@ -108,7 +108,8 @@ CREATE TABLE IF NOT EXISTS users (
     settings            TEXT NOT NULL DEFAULT '{}',
     avatar_id           INTEGER,
     is_admin            INTEGER NOT NULL DEFAULT 0,
-    storage_limit       INTEGER
+    storage_limit       INTEGER,
+    cache_generation    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -314,6 +315,9 @@ def prepare_db(conn: sqlite3.Connection, keyring: "KeyRing | None" = None) -> No
             version = 4
         if version == 4:
             _migrate_4_to_5(conn)
+            version = 5
+        if version == 5:
+            _migrate_5_to_6(conn)
     elif version > SCHEMA_VERSION:
         raise RuntimeError("Die Datenbank stammt von einer neueren Programmversion.")
     try:
@@ -427,6 +431,21 @@ def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
         conn.rollback()
         raise
     print("Migration auf Schema v5 abgeschlossen.")
+
+
+def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
+    """Fügt einen versionierten Trigger für das Zurücksetzen lokaler Browserdaten hinzu."""
+    conn.execute("BEGIN")
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+        if "cache_generation" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN cache_generation INTEGER NOT NULL DEFAULT 0")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '6')")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    print("Migration auf Schema v6 abgeschlossen.")
 
 
 def key_ids_in_db(conn: sqlite3.Connection) -> dict[str, int]:

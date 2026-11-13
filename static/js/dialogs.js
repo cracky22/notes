@@ -2,6 +2,7 @@
 import { Delta } from './delta.js';
 import { renderHTML } from './editor.js';
 import { docFromView } from './sync.js';
+import { clearLocalAppCache } from './offline.js';
 import {
   h, icon, iconBtn, avatar, openModal, openPopover, closePopover, menu, toast, confirmDialog, fmtDate, fmtDateLong, animate,
 } from './dom.js';
@@ -402,10 +403,29 @@ export function openSettings() {
       toggleRow('Abgehakte Elemente nach unten verschieben', 'checkedBottom'),
       h('div', { class: 'set-section', text: 'Darstellung' }),
       themeRow,
+      toggleRow('Snackbars und Statusmeldungen anzeigen', 'snackbarsEnabled', 'Blendet Offline-, Synchronisations- und Erfolgshinweise aus. Sicherheits- und Bestätigungsdialoge bleiben aktiv.'),
       h('div', { class: 'set-section', text: 'Tastenkürzel' }),
       toggleRow('Tastenkürzel aktivieren', 'shortcutsEnabled', 'Einzeltasten wie C, J, K, E gelten nur außerhalb von Textfeldern.'),
       scList,
-      h('div', { class: 'set-reset' }, h('button', { type: 'button', class: 'text-btn', onclick: () => { updateSettings({ shortcuts: {} }); drawShortcuts(); } }, 'Alle Tastenkürzel zurücksetzen'))),
+      h('div', { class: 'set-reset' }, h('button', { type: 'button', class: 'text-btn', onclick: () => { updateSettings({ shortcuts: {} }); drawShortcuts(); } }, 'Alle Tastenkürzel zurücksetzen')),
+      h('div', { class: 'set-section', text: 'Offline und lokale Daten' }),
+      h('p', { class: 'muted cache-help', text: 'Setzt app-eigene Browserdaten zurück (Ansicht sowie CacheStorage/IndexedDB, falls vorhanden). Notizen werden in dieser Version nicht dauerhaft offline gespeichert; Serverdaten bleiben erhalten. Nicht synchronisierte Änderungen gehen verloren.' }),
+      (() => {
+        const status = h('p', { class: 'form-error cache-status', role: 'status', 'aria-live': 'polite' });
+        const clear = h('button', { type: 'button', class: 'text-btn danger', text: 'Offline-Cache leeren', onclick: async () => {
+          clear.disabled = true; status.textContent = '';
+          try {
+            if (!navigator.onLine) throw new Error('Zum sicheren Zurückladen der Daten benötigst du eine Internetverbindung.');
+            await api('GET', '/api/me');
+            if (!await confirmDialog('Lokale App-Daten auf diesem Gerät löschen und neu laden? Nicht synchronisierte Änderungen in dieser Sitzung gehen verloren.', 'Löschen', 'Offline-Cache leeren')) return;
+            await clearLocalAppCache(state.user?.id, state.user?.cache_generation ?? 0);
+            m.close();
+            location.reload();
+          } catch (err) { status.textContent = err.message; }
+          finally { clear.disabled = false; }
+        } });
+        return h('div', { class: 'cache-actions' }, clear, status);
+      })()),
     h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'text-btn primary', onclick: () => m.close() }, 'Fertig')));
   const m = openModal(content, { className: 'small settings', label: 'Einstellungen' });
 }

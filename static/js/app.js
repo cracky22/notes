@@ -2,9 +2,10 @@
 import { renderHTML } from './editor.js';
 import { Connection, NoteState, rid } from './sync.js';
 import { NoteEditor } from './noteeditor.js';
+import { clearLocalAppCache, reconcileCacheGeneration } from './offline.js';
 import * as D from './dialogs.js';
 import {
-  $, h, icon, iconBtn, setIcon, avatar, openModal, modals, openPopover, closePopover, popoverOwner, menu, toast, hideToast,
+  $, h, icon, iconBtn, setIcon, avatar, openModal, modals, openPopover, closePopover, popoverOwner, menu, toast, hideToast, setSnackbarsEnabled,
   confirmDialog, captureLayout, playLayout, debounce, plural, pickFiles, shrinkImage, animate,
 } from './dom.js';
 import {
@@ -49,6 +50,9 @@ let deferredSearchTask = false;
 // Serverseitiger Suchindex (eigener Bereich je Benutzer); bis er bereit ist, wird lokal gesucht
 const serverSearch = { q: '', ids: null, ready: false, state: null, done: 0, total: 0, seq: 0, timer: null };
 const composer = { expanded: false, ed: null, ns: null, meta: null };
+let composerSaving = false;
+let cacheResetPending = false;
+let cacheResetPoll = null;
 
 // ===========================================================================
 // Kategorien für die Suche (wie „Typen“, „Dinge“, „Farben“ im Original)
@@ -974,6 +978,7 @@ function discardComposer() {
 
 async function closeComposer() {
   if (!composer.expanded) return;
+  composerSaving = true;
   composer.ed.flush();
   const { ns, meta, ed } = composer;
   ed.destroy();
@@ -984,7 +989,7 @@ async function closeComposer() {
   const d = ns.doc;
   const items = d.items.filter(i => i.text.trim());
   const empty = !d.title.trim() && (d.is_list ? !items.length : !d.body.text().trim()) && !meta.images.length;
-  if (empty) return;
+  if (empty) { composerSaving = false; return; }
   try {
     const view = await api('POST', '/api/notes', {
       title: d.title, body: d.body.ops, items, is_list: d.is_list, color: meta.color,
@@ -997,7 +1002,7 @@ async function closeComposer() {
   } catch (e) {
     handleError(e);
     if (!(e instanceof AuthError)) { meta.archived = false; expandComposer({ draft: { ns, meta } }); }
-  }
+  } finally { composerSaving = false; }
 }
 
 // ===========================================================================
@@ -1159,6 +1164,7 @@ function cycleTheme() {
 }
 function applySettings() {
   applyTheme();
+  setSnackbarsEnabled(setting('snackbarsEnabled') !== false);
   if (state.user) {
     renderHeader();
     renderMain();
@@ -1201,10 +1207,32 @@ function updateUser(info) {
 // ===========================================================================
 // Server-Verbindung
 // ===========================================================================
+function handleCacheReset(generationValue) {
+  const generation = Number(generationValue);
+  if (!Number.isSafeInteger(generation) || generation <= Number(state.user?.cache_generation || 0) || !state.user) return;
+  state.user.cache_generation = generation;
+  cacheResetPending = true;
+  clearLocalAppCache(state.user.id, generation).then(() => {
+    toast('Lokale App-Daten werden zurückgesetzt; die Seite aktualisiert sich nach Abschluss offener Änderungen.');
+    if (cacheResetPoll) return;
+    cacheResetPoll = setInterval(() => {
+      const hasPendingOps = [...state.notes.values()].some(note => note.ns?.pending());
+      const safeToReload = ready && state.online && navigator.onLine && !editor && !composer.expanded &&
+        !composerSaving && !modals.length && !hasPendingOps;
+      if (!cacheResetPending || !safeToReload) return;
+      cacheResetPending = false;
+      clearInterval(cacheResetPoll);
+      cacheResetPoll = null;
+      location.reload();
+    }, 900);
+  });
+}
+
 function onMessage(msg) {
   if (!ready && msg.t !== 'hello' && msg.t !== 'pong') { queue.push(msg); return; }
   const n = msg.id != null ? state.notes.get(msg.id) : null;
   switch (msg.t) {
+    case 'hello': handleCacheReset(msg.cache_generation); break;
     case 'op': if (n) n.ns.remote(msg); else if (msg.client !== conn.clientId) fetchNote(msg.id); break;
     case 'ack': if (n) n.ns.ack(msg.rev, msg.cid); break;
     case 'caught': if (n) n.ns.caught(); break;
@@ -1216,6 +1244,7 @@ function onMessage(msg) {
     case 'user': updateUser(msg.user); break;
     case 'labels': api('GET', '/api/labels').then(l => { state.labels = l; render(); }).catch(handleError); break;
     case 'settings': state.settings = msg.settings || {}; applySettings(); break;
+    case 'cache_reset': handleCacheReset(msg.generation); break;
     case 'positions':
       for (const [id, pos] of Object.entries(msg.positions)) { const x = state.notes.get(Number(id)); if (x) x.position = pos; }
       scheduleRender();
@@ -1368,6 +1397,7 @@ async function approvePairIfPresent() {
 }
 
 async function showApp() {
+  setSnackbarsEnabled(setting('snackbarsEnabled') !== false);
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
   state.layout = store.get('layout', 'grid') === 'list' ? 'list' : 'grid';
@@ -1425,6 +1455,7 @@ async function boot() {
     const me = magic
       ? await api('POST', '/api/magic-links/redeem', { token: magic }, { auth: false })
       : await api('GET', '/api/me', undefined, { auth: false });
+    await reconcileCacheGeneration(me);
     state.user = me;
     state.settings = me.settings || {};
     await showApp();
@@ -1461,6 +1492,7 @@ function init() {
     btn.disabled = true;
     try {
       const me = await api('POST', '/api/login', { username, password }, { auth: false });
+      await reconcileCacheGeneration(me);
       state.user = me;
       state.settings = me.settings || {};
       $('#login-pass').value = '';

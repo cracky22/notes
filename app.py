@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import subprocess
 import threading
@@ -338,7 +339,7 @@ def _session_user(conn, token: str | None):
     if not token:
         return None
     return conn.execute(
-        "SELECT u.id, u.username, u.avatar_id, u.settings, u.is_admin, u.storage_limit, s.token_hash FROM sessions s "
+        "SELECT u.id, u.username, u.avatar_id, u.settings, u.is_admin, u.storage_limit, u.cache_generation, s.token_hash FROM sessions s "
         "JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?",
         (_token_hash(token), core.now()),
     ).fetchone()
@@ -400,6 +401,15 @@ class DeviceChallengeIn(BaseModel):
 
 class AdminLimitIn(BaseModel):
     storage_limit: int | None = Field(default=None, ge=0, le=10**13)
+
+
+class AdminUserCreateIn(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=8, max_length=core.MAX_PASSWORD_LEN)
+
+
+class AdminPasswordResetIn(BaseModel):
+    new_password: str = Field(min_length=8, max_length=core.MAX_PASSWORD_LEN)
 
 
 class SearchQueryIn(BaseModel):
@@ -753,7 +763,8 @@ def me_view(row) -> dict:
     except json.JSONDecodeError:
         settings = {}
     return {"id": row["id"], "username": row["username"], "avatar": row["avatar_id"], "settings": settings,
-            "is_admin": bool(row["is_admin"]) if "is_admin" in row.keys() else False}
+            "is_admin": bool(row["is_admin"]) if "is_admin" in row.keys() else False,
+            "cache_generation": int(row["cache_generation"]) if "cache_generation" in row.keys() else 0}
 
 
 def storage_usage(conn, user_id: int) -> int:
@@ -1594,10 +1605,10 @@ def admin_metrics(_admin=Depends(admin_user)):
 def admin_list_users(_admin=Depends(admin_user), conn=Depends(get_db)):
     out=[]
     index_status=sidx.all_status(conn)
-    for r in conn.execute("SELECT id,username,is_admin,storage_limit,created_at FROM users ORDER BY username COLLATE NOCASE"):
+    for r in conn.execute("SELECT id,username,is_admin,storage_limit,created_at,cache_generation FROM users ORDER BY username COLLATE NOCASE"):
         note_count=conn.execute("SELECT COUNT(*) FROM notes WHERE owner_id=?",(r["id"],)).fetchone()[0]
         out.append({"id":r["id"],"username":r["username"],"is_admin":bool(r["is_admin"]),
-                    "storage_limit":r["storage_limit"],"used_bytes":storage_usage(conn,r["id"]),
+                    "storage_limit":r["storage_limit"],"cache_generation":int(r["cache_generation"] or 0),"used_bytes":storage_usage(conn,r["id"]),
                     "notes":note_count,"sessions":conn.execute("SELECT COUNT(*) FROM sessions WHERE user_id=? AND expires_at>?",
                     (r["id"],core.now())).fetchone()[0],
                     "search_index":index_status.get(r["id"],{"state":"pending","entries":0,"bytes":0,"done":0,"total":0,
@@ -1613,6 +1624,62 @@ def admin_reset_search_index(user_id:int, _admin=Depends(admin_user), conn=Depen
     conn.commit()
     wake_indexer()
     return sidx.status(conn,user_id)
+
+
+@app.post("/api/admin/users/{user_id}/offline-cache/reset")
+def admin_reset_offline_cache(user_id:int, _admin=Depends(admin_user), conn=Depends(get_db)):
+    row=conn.execute("SELECT username,cache_generation FROM users WHERE id=?",(user_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Benutzer nicht gefunden")
+    generation=int(row["cache_generation"] or 0)+1
+    conn.execute("UPDATE users SET cache_generation=? WHERE id=?",(generation,user_id))
+    conn.commit()
+    hub.publish([user_id], {"t":"cache_reset","generation":generation})
+    return {"username":row["username"],"cache_generation":generation}
+
+
+@app.post("/api/admin/users", status_code=201)
+def admin_create_user(body:AdminUserCreateIn, _admin=Depends(admin_user), conn=Depends(get_db)):
+    try:
+        username=core.validate_username(body.username)
+        core.validate_password(body.password)
+    except ValueError as exc:
+        raise HTTPException(400,str(exc)) from exc
+    if conn.execute("SELECT 1 FROM users WHERE username=?",(username,)).fetchone():
+        raise HTTPException(409,"Dieser Benutzername ist bereits vergeben.")
+    t=core.now()
+    try:
+        cur=conn.execute("INSERT INTO users(username,password_hash,created_at,password_changed_at) VALUES (?,?,?,?)",
+                         (username,core.hash_password(body.password),t,t))
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409,"Dieser Benutzername ist bereits vergeben.") from exc
+    conn.commit()
+    wake_indexer()
+    return {"id":cur.lastrowid,"username":username}
+
+
+@app.post("/api/admin/users/{user_id}/password")
+def admin_reset_user_password(user_id:int, body:AdminPasswordResetIn, _admin=Depends(admin_user), conn=Depends(get_db)):
+    row=conn.execute("SELECT username FROM users WHERE id=?",(user_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Benutzer nicht gefunden")
+    try:
+        core.validate_password(body.new_password)
+    except ValueError as exc:
+        raise HTTPException(400,str(exc)) from exc
+    conn.execute("UPDATE users SET password_hash=?,password_changed_at=? WHERE id=?",
+                 (core.hash_password(body.new_password),core.now(),user_id))
+    if user_id==_admin["id"]:
+        hashes=[r[0] for r in conn.execute("SELECT token_hash FROM sessions WHERE user_id=? AND token_hash<>?",
+                                            (user_id,_admin["token_hash"]))]
+        conn.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?",(user_id,_admin["token_hash"]))
+    else:
+        hashes=[r[0] for r in conn.execute("SELECT token_hash FROM sessions WHERE user_id=?",(user_id,))]
+        conn.execute("DELETE FROM sessions WHERE user_id=?",(user_id,))
+    magic_links=conn.execute("DELETE FROM magic_links WHERE user_id=?",(user_id,)).rowcount
+    conn.commit()
+    hub.close_sessions(hashes)
+    return {"username":row["username"],"revoked_sessions":len(hashes),"revoked_magic_links":magic_links}
 
 
 @app.patch("/api/admin/users/{user_id}")
@@ -1813,7 +1880,7 @@ async def websocket(ws: WebSocket):
     conn = Conn(ws, user, client_id, user["token_hash"])
     hub.add(conn)
     writer = asyncio.create_task(conn.writer())
-    _send(conn, {"t": "hello", "conn": conn.id})
+    _send(conn, {"t": "hello", "conn": conn.id, "cache_generation": int(user["cache_generation"] or 0)})
     try:
         while not conn.closed:
             text = await ws.receive_text()
