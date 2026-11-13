@@ -53,7 +53,7 @@ VERSIONS_KEEP = 100       # maximale Anzahl Versionen je Notiz
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_SIDE = 2560
 AVATAR_SIDE = 256
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{3,64}$")
 MIN_PASSWORD_LEN = 8
@@ -61,7 +61,8 @@ MAX_PASSWORD_LEN = 1024
 
 # Textspalten mit verschlüsseltem Inhalt "<schlüssel-id>:<daten>" (für Rotation & Prüfungen)
 ENCRYPTED_COLUMNS = (("notes", "payload"), ("labels", "name"), ("note_ops", "op"),
-                     ("note_versions", "payload"))
+                     ("note_versions", "payload"), ("search_entries", "payload"),
+                     ("search_index", "token_key_enc"))
 # Binärdaten (Bilder, Profilbilder) stehen in blobs.data, die Schlüssel-ID in blobs.key_id
 
 
@@ -193,6 +194,43 @@ CREATE TABLE IF NOT EXISTS note_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_versions_note ON note_versions(note_id);
 
+-- Suchindex: Status und eigener, verschlüsselter Bereich je Benutzer
+CREATE TABLE IF NOT EXISTS search_index (
+    user_id       INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    state         TEXT NOT NULL DEFAULT 'pending',
+    version       INTEGER NOT NULL DEFAULT 0,
+    generation    INTEGER NOT NULL DEFAULT 0,
+    requested_at  INTEGER,
+    requested_by  TEXT,
+    token_key_enc TEXT NOT NULL,
+    started_at    INTEGER,
+    built_at      INTEGER,
+    done          INTEGER NOT NULL DEFAULT 0,
+    total         INTEGER NOT NULL DEFAULT 0,
+    error         TEXT,
+    user_reset_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS search_entries (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    note_id    INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    rev        INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    payload    TEXT NOT NULL,
+    PRIMARY KEY (user_id, note_id)
+);
+CREATE INDEX IF NOT EXISTS idx_search_entries_note ON search_entries(note_id);
+CREATE TABLE IF NOT EXISTS search_terms (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL,
+    note_id    INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, token_hash, note_id)
+);
+CREATE INDEX IF NOT EXISTS idx_search_terms_lookup ON search_terms(user_id, token_hash, note_id);
+CREATE TABLE IF NOT EXISTS search_dirty (
+    note_id   INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+    marked_at INTEGER NOT NULL
+);
+
 -- Bilder und Profilbilder (data verschlüsselt: nonce || ciphertext || tag)
 CREATE TABLE IF NOT EXISTS blobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -273,6 +311,9 @@ def prepare_db(conn: sqlite3.Connection, keyring: "KeyRing | None" = None) -> No
             version = 3
         if version == 3:
             _migrate_3_to_4(conn)
+            version = 4
+        if version == 4:
+            _migrate_4_to_5(conn)
     elif version > SCHEMA_VERSION:
         raise RuntimeError("Die Datenbank stammt von einer neueren Programmversion.")
     try:
@@ -371,6 +412,21 @@ def _migrate_3_to_4(conn: sqlite3.Connection) -> None:
         conn.rollback()
         raise
     print("Migration auf Schema v4 abgeschlossen.")
+
+
+def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
+    """Legt die Suchindex-Tabellen an; der Index selbst wird danach im Hintergrund aufgebaut."""
+    conn.execute("BEGIN")
+    try:
+        for stmt in SCHEMA.split(";"):
+            if stmt.strip():
+                conn.execute(stmt)
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '5')")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    print("Migration auf Schema v5 abgeschlossen.")
 
 
 def key_ids_in_db(conn: sqlite3.Connection) -> dict[str, int]:

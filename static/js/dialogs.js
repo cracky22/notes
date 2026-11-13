@@ -585,6 +585,7 @@ export function accountPopover(anchor) {
   const big = avatar(u, 80, 'big');
   const cam = iconBtn('photo_camera', 'Profilbild ändern', () => { closePopover(); app.changeAvatar(); }, 'avatar-cam', 18);
   const usage = h('div', { class: 'account-usage' }, h('span', { text: 'Speicherbelegung wird geladen …' }));
+  const indexBox = h('div', { class: 'account-index' }, h('span', { text: 'Suchindex wird geprüft …' }));
   const items = [
     { label: 'Profilbild ändern', icon: 'photo_camera', action: () => app.changeAvatar() },
     u.avatar && { label: 'Profilbild entfernen', icon: 'delete', action: () => app.removeAvatar() },
@@ -598,7 +599,8 @@ export function accountPopover(anchor) {
   ];
   openPopover(anchor, h('div', { class: 'account-pop' },
     h('div', { class: 'account-head' }, h('div', { class: 'avatar-wrap' }, big, cam), h('div', { class: 'account-name', text: u.username })),
-    usage, menu(items)), { align: 'end' });
+    usage, indexBox, menu(items)), { align: 'end' });
+  pollSearchIndex(indexBox);
   api('GET', '/api/me/usage').then(data => {
     const used = formatBytes(data.used_bytes);
     const limit = data.limit_bytes == null ? null : formatBytes(data.limit_bytes);
@@ -606,6 +608,49 @@ export function accountPopover(anchor) {
       h('span', { text: limit ? `von ${limit}` : 'belegt' })),
       data.limit_bytes != null ? h('div', { class: 'usage-track' }, h('span', { style: { width: `${Math.min(100, data.used_bytes / Math.max(1, data.limit_bytes) * 100)}%` } })) : null);
   }).catch(() => { usage.textContent = 'Speicherbelegung nicht verfügbar'; });
+}
+
+const INDEX_STATES = {
+  ready: 'Suchindex aktuell', pending: 'Suchindex wartet auf Neuaufbau',
+  building: 'Suchindex wird aufgebaut', error: 'Suchindex fehlerhaft',
+};
+
+async function pollSearchIndex(box) {
+  if (!box.isConnected && box.dataset.started) return;
+  box.dataset.started = '1';
+  try {
+    const st = await api('GET', '/api/me/search-index');
+    if (!box.isConnected) return;
+    drawSearchIndex(box, st);
+    if (st.state === 'pending' || st.state === 'building') setTimeout(() => pollSearchIndex(box), 2000);
+  } catch { box.textContent = 'Suchindex-Status nicht verfügbar'; }
+}
+
+function drawSearchIndex(box, st) {
+  const busy = st.state === 'pending' || st.state === 'building';
+  const cooling = st.cooldown > 0 && st.state !== 'error';
+  const when = st.built_at ? new Date(st.built_at * 1000).toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' }) : null;
+  const detail = st.state === 'building' ? `${st.done} / ${st.total} Notizen indiziert`
+    : st.state === 'ready' ? [`${st.entries} Notizen`, formatBytes(st.bytes), when && `erstellt ${when}`].filter(Boolean).join(' · ')
+    : st.state === 'error' ? (st.error || 'Unbekannter Fehler') : 'Neuaufbau startet in Kürze';
+  const btn = h('button', {
+    type: 'button', class: 'text-btn', text: 'Neu indizieren', disabled: busy || cooling,
+    title: cooling ? `Wieder möglich in ${Math.ceil(st.cooldown / 60)} Min.` : 'Suchindex verwerfen und neu aufbauen',
+    onclick: async e => {
+      e.stopPropagation();
+      btn.disabled = true;
+      try {
+        drawSearchIndex(box, await api('POST', '/api/me/search-index/rebuild'));
+        toast('Suchindex wird neu aufgebaut');
+        setTimeout(() => pollSearchIndex(box), 1500);
+      } catch (err) { toast(err.message); btn.disabled = false; }
+    },
+  });
+  const pct = st.total ? Math.min(100, st.done / st.total * 100) : 0;
+  box.replaceChildren(
+    h('div', { class: 'index-label' }, h('strong', { text: INDEX_STATES[st.state] || st.state }), btn),
+    h('div', { class: 'index-detail', text: detail }),
+    st.state === 'building' ? h('div', { class: 'usage-track' }, h('span', { style: { width: `${pct}%` } })) : null);
 }
 
 function formatBytes(bytes) {

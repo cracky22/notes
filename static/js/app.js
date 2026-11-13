@@ -46,6 +46,8 @@ let queue = [];
 let editor = null;          // {ed, note, modal}
 let deferredObserver = null;
 let deferredSearchTask = false;
+// Serverseitiger Suchindex (eigener Bereich je Benutzer); bis er bereit ist, wird lokal gesucht
+const serverSearch = { q: '', ids: null, ready: false, state: null, done: 0, total: 0, seq: 0, timer: null };
 const composer = { expanded: false, ed: null, ns: null, meta: null };
 
 // ===========================================================================
@@ -94,10 +96,41 @@ function matchesFilter(n, f) {
   if (f.kind === 'thing') return isThing(n, THINGS.find(t => t[0] === f.value));
   return true;
 }
-function haystack(n) {
+function metaHaystack(n) {
   const labels = n.labels.map(id => (state.labels.find(l => l.id === id) || {}).name || '');
   const people = n.members.map(m => m.username);
-  return [noteText(n), ...labels, ...people].join('\n').toLocaleLowerCase();
+  return [...labels, ...people].join('\n').toLocaleLowerCase();
+}
+function haystack(n) {
+  return [noteText(n).toLocaleLowerCase(), metaHaystack(n)].join('\n');
+}
+// Inhalte nicht geladener Archivnotizen werden nur gebraucht, solange der Index nicht bereit ist
+// oder ein inhaltsabhängiger Filter (Typ/Ding) aktiv ist.
+function needsContentForSearch() {
+  return !serverSearch.ready || (state.filter && (state.filter.kind === 'type' || state.filter.kind === 'thing'));
+}
+function requestServerSearch(delay = null) {
+  clearTimeout(serverSearch.timer);
+  const q = state.search.trim();
+  serverSearch.timer = setTimeout(async () => {
+    const seq = ++serverSearch.seq;
+    try {
+      const r = await api('POST', '/api/search', { q });
+      if (seq !== serverSearch.seq || !state.searching) return;
+      Object.assign(serverSearch, { q, ids: new Set(r.ids), ready: !!r.ready, state: r.state, done: r.done, total: r.total });
+      if (!r.ready) serverSearch.timer = setTimeout(() => { if (state.searching) requestServerSearch(0); }, 3000);
+    } catch (e) {
+      if (seq !== serverSearch.seq) return;
+      Object.assign(serverSearch, { q, ids: null, ready: false, state: 'offline' });
+    }
+    if (state.searching) scheduleRender();
+  }, delay ?? (q ? 220 : 0));
+}
+function cancelServerSearch() {
+  clearTimeout(serverSearch.timer);
+  serverSearch.seq++;
+  serverSearch.ids = null;
+  serverSearch.q = '';
 }
 
 // ===========================================================================
@@ -451,7 +484,7 @@ function applyRoute() {
 function visibleNotes() {
   const q = state.search.trim().toLocaleLowerCase();
   let list = [...state.notes.values()].filter(n => {
-    if (state.searching) return !n.trashed && !n.contentDeferred;
+    if (state.searching) return !n.trashed && (!n.contentDeferred || !needsContentForSearch());
     if (state.view === 'trash') return n.trashed;
     if (n.trashed) return false;
     if (state.view === 'archive') return n.archived;
@@ -462,7 +495,12 @@ function visibleNotes() {
     list = list.filter(n => matchesFilter(n, state.filter));
     if (q) {
       const words = q.split(/\s+/);
-      list = list.filter(n => { const hay = haystack(n); return words.every(w => hay.includes(w)); });
+      const hits = serverSearch.ready && serverSearch.ids && serverSearch.q.toLocaleLowerCase() === q ? serverSearch.ids : null;
+      list = list.filter(n => {
+        if (hits && hits.has(n.id)) return true;
+        const hay = n.contentDeferred ? metaHaystack(n) : haystack(n);
+        return words.every(w => hay.includes(w));
+      });
     }
   }
   return list.sort((a, b) => b.position - a.position || b.id - a.id);
@@ -559,10 +597,14 @@ function renderMain() {
     renderSearchPanel(area);
     return;
   }
-  if (state.searching) {
+  if (state.searching && needsContentForSearch()) {
     const pending=[...state.notes.values()].filter(n=>n.contentDeferred);
     if (pending.length) {
-      notice.append(h('div',{class:'archive-load-notice',text:`Archivierte Notizen werden für die Suche nachgeladen (${pending.length}) …`}));
+      const building = serverSearch.state === 'pending' || serverSearch.state === 'building';
+      const text = building
+        ? `Suchindex wird aufgebaut (${serverSearch.done} / ${serverSearch.total}) – archivierte Notizen werden solange direkt geladen (${pending.length}) …`
+        : `Archivierte Notizen werden für die Suche nachgeladen (${pending.length}) …`;
+      notice.append(h('div',{class:'archive-load-notice',text}));
       ensureDeferredForSearch(pending);
     }
   }
@@ -846,12 +888,14 @@ function enterSearch() {
   closeComposer();
   clearSelection();
   state.searching = true;
+  requestServerSearch(0);
   render();
 }
 
 function exitSearch(rerender = true) {
   if (!state.searching) return;
   state.searching = false;
+  cancelServerSearch();
   state.search = '';
   state.filter = null;
   $('#search-input').value = '';
@@ -1448,7 +1492,7 @@ function init() {
   input.addEventListener('input', () => {
     state.search = input.value;
     $('#search-clear').classList.toggle('hidden', !state.search && !state.filter);
-    if (!state.searching) enterSearch(); else renderMain();
+    if (!state.searching) enterSearch(); else { requestServerSearch(); renderMain(); }
   });
   input.addEventListener('keydown', e => {
     if (e.key === 'Backspace' && !input.value && state.filter) { state.filter = null; renderHeader(); renderMain(); }
@@ -1458,6 +1502,7 @@ function init() {
     input.value = '';
     state.search = '';
     state.filter = null;
+    requestServerSearch(0);
     renderHeader();
     renderMain();
     input.focus();

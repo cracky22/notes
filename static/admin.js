@@ -14,8 +14,39 @@ async function api(method, url, body) {
   if (!res.ok) { let d={}; try { d=await res.json(); } catch {} throw new Error(d.detail || `Fehler ${res.status}`); }
   return res.status===204 ? null : res.json();
 }
+const INDEX_LABELS={ready:'Aktuell',pending:'Wartet',building:'Wird aufgebaut',error:'Fehler'};
+const BY_LABELS={admin:'Admin',user:'Nutzer',system:'System'};
+const indexCells=new Map();
+let indexPoll=null;
+let passwordTarget=null;
+function drawIndexCell(cell,st) {
+  cell.replaceChildren();
+  const head=document.createElement('div'); head.className=`index-state index-${st.state}`; head.textContent=INDEX_LABELS[st.state]||st.state;
+  const sub=document.createElement('div'); sub.className='admin-sub';
+  if (st.state==='building') sub.textContent=`${st.done} / ${st.total} Notizen`;
+  else if (st.state==='ready') sub.textContent=`${st.entries} Einträge · ${fmt(st.bytes)} · ${date(st.built_at)}`;
+  else if (st.state==='error') sub.textContent=st.error||'Unbekannter Fehler';
+  else sub.textContent=st.requested_by?`angestoßen von ${BY_LABELS[st.requested_by]||st.requested_by}`:'Neuaufbau startet in Kürze';
+  cell.append(head,sub);
+  if (st.state==='building' && st.total) {
+    const track=document.createElement('div'); track.className='quota-track'; const fill=document.createElement('span');
+    fill.style.width=`${Math.min(100,st.done/st.total*100)}%`; track.append(fill); cell.append(track);
+  }
+}
+function scheduleIndexPoll(rows) {
+  clearTimeout(indexPoll);
+  if (!rows.some(u=>['pending','building'].includes(u.search_index?.state))) return;
+  indexPoll=setTimeout(async()=>{
+    try {
+      const fresh=await api('GET','/api/admin/users');
+      for (const u of fresh) { const cell=indexCells.get(u.id); if (cell&&u.search_index) drawIndexCell(cell,u.search_index); }
+      scheduleIndexPoll(fresh);
+    } catch {}
+  },2500);
+}
 function toast(text) { const el=$('#notice'); el.textContent=text; el.classList.add('show'); setTimeout(()=>el.classList.remove('show'),2600); }
 function showError(text='') { const e=$('#error'); e.textContent=text; e.classList.toggle('hidden',!text); }
+function showCreateError(text='') { const e=$('#create-user-error'); e.textContent=text; e.classList.toggle('hidden',!text); }
 async function load() {
   showError();
   try {
@@ -23,6 +54,7 @@ async function load() {
     const used=rows.reduce((a,u)=>a+u.used_bytes,0), limited=rows.filter(u=>u.storage_limit!=null).length;
     $('#totals').textContent=`${rows.length} Nutzer · ${fmt(used)} belegt · ${limited} mit Limit`;
     $('#users').replaceChildren();
+    indexCells.clear();
     for (const u of rows) {
       const pct=u.storage_limit ? Math.min(100,u.used_bytes/u.storage_limit*100) : 0;
       const limitInput=document.createElement('input'); limitInput.type='number'; limitInput.min='0'; limitInput.step='0.1'; limitInput.placeholder='unbegrenzt';
@@ -52,10 +84,26 @@ async function load() {
       const lim=document.createElement('span'); lim.textContent=u.storage_limit==null?'unbegrenzt':`von ${fmt(u.storage_limit)}`;
       line.append(amount,lim); const track=document.createElement('div'); track.className='quota-track'; const fill=document.createElement('span'); fill.style.width=`${pct}%`; track.append(fill); usage.append(line,track);
       const edit=document.createElement('div'); edit.className='limit-edit'; edit.append(limitInput,document.createTextNode('MB'),save);
-      const actions=document.createElement('div'); actions.className='admin-actions'; actions.append(sessions);
-      tr.append(td('',user),td('',String(u.notes)),td('',usage),td('',edit),td('',String(u.sessions)),td('',actions));
+      const resetPassword=document.createElement('button'); resetPassword.className='text-btn'; resetPassword.textContent='Passwort zurücksetzen';
+      resetPassword.addEventListener('click',()=>openPasswordReset(u));
+      const reindex=document.createElement('button'); reindex.className='text-btn'; reindex.textContent='Index zurücksetzen';
+      const indexCell=document.createElement('div'); indexCell.className='index-cell'; indexCells.set(u.id,indexCell);
+      drawIndexCell(indexCell,u.search_index||{state:'pending'});
+      reindex.addEventListener('click',async()=>{
+        if (!confirm(`Suchindex von ${u.username} löschen und neu aufbauen?`)) return;
+        reindex.disabled=true;
+        try {
+          const st=await api('POST',`/api/admin/users/${u.id}/search-index/reset`);
+          drawIndexCell(indexCell,st); toast(`Suchindex von ${u.username} wird neu aufgebaut`);
+          scheduleIndexPoll([{search_index:st}]);
+        } catch(e) { showError(e.message); }
+        finally { reindex.disabled=false; }
+      });
+      const actions=document.createElement('div'); actions.className='admin-actions'; actions.append(resetPassword,reindex,sessions);
+      tr.append(td('',user),td('',String(u.notes)),td('',usage),td('',edit),td('',String(u.sessions)),td('',indexCell),td('',actions));
       $('#users').append(tr);
     }
+    scheduleIndexPoll(rows);
   } catch(e) { showError(e.message); }
 }
 function metricCard(title,value,detail,percent=null) {
@@ -103,6 +151,47 @@ async function loadMetrics() {
   }
 }
 
+function openPasswordReset(user) {
+  passwordTarget=user;
+  $('#reset-password-user').textContent=user.username;
+  $('#reset-password').value=''; $('#reset-password-confirm').value='';
+  $('#password-dialog-error').textContent=''; $('#password-dialog-error').classList.add('hidden');
+  $('#password-dialog').showModal();
+  $('#reset-password').focus();
+}
+$('#cancel-password-reset').addEventListener('click',()=>$('#password-dialog').close());
+$('#reset-password-form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const pass=$('#reset-password').value, confirmPass=$('#reset-password-confirm').value;
+  const err=$('#password-dialog-error');
+  if (pass!==confirmPass) { err.textContent='Die Passwörter stimmen nicht überein.'; err.classList.remove('hidden'); return; }
+  if (!passwordTarget) return;
+  const submit=$('#save-password-reset'); submit.disabled=true; err.textContent=''; err.classList.add('hidden');
+  try {
+    const r=await api('POST',`/api/admin/users/${passwordTarget.id}/password`,{new_password:pass});
+    $('#password-dialog').close();
+    toast(`Passwort für ${r.username} geändert · ${r.revoked_sessions} Sitzungen und ${r.revoked_magic_links} Anmeldelinks widerrufen`);
+    passwordTarget=null; await load();
+  } catch(e) { err.textContent=e.message; err.classList.remove('hidden'); }
+  finally { submit.disabled=false; }
+});
+$('#create-user-form').addEventListener('submit',async e=>{
+  e.preventDefault(); showCreateError();
+  const username=$('#new-username').value.trim();
+  const password=$('#new-password').value;
+  const confirmPassword=$('#new-password-confirm').value;
+  if(password!==confirmPassword) { showCreateError('Die Passwörter stimmen nicht überein.'); return; }
+  const button=$('#create-user-button'); button.disabled=true;
+  try {
+    const user=await api('POST','/api/admin/users',{username,password});
+    $('#create-user-form').reset();
+    showCreateError();
+    toast(`Nutzer ${user.username} angelegt`);
+    await load();
+  } catch(e) { showCreateError(e.message); }
+  finally { button.disabled=false; }
+});
+$('#password-dialog').addEventListener('close',()=>{ $('#reset-password').value=''; $('#reset-password-confirm').value=''; passwordTarget=null; });
 $('#refresh').addEventListener('click',()=>{load();loadMetrics();});
 load();
 loadMetrics();
