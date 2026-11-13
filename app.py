@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -25,6 +26,7 @@ import subprocess
 import threading
 import time
 import uuid
+import zlib
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -192,7 +194,15 @@ def preflight() -> None:
 async def lifespan(_app: FastAPI):
     preflight()
     hub.loop = asyncio.get_running_loop()
-    yield
+    compressor = asyncio.create_task(compress_existing_archived_notes())
+    try:
+        yield
+    finally:
+        compressor.cancel()
+        try:
+            await compressor
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Notizen", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -390,12 +400,124 @@ class LabelIn(BaseModel):
 # --------------------------------------------------------------------------- #
 # Notizen: Laden, Speichern, Ansichten
 # --------------------------------------------------------------------------- #
+COMPRESSED_PREFIX = core.COMPRESSED_PAYLOAD_PREFIX
+
+
+def _decrypted_payload_text(token: str) -> str:
+    return core.decompress_payload_text(keyring.decrypt(token))
+
+
 def load_doc(row) -> dict:
-    return json.loads(keyring.decrypt(row["payload"]))
+    return json.loads(_decrypted_payload_text(row["payload"]))
 
 
-def store_doc(doc: dict) -> str:
-    return keyring.encrypt(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
+def _compressed_envelope(text: str) -> str | None:
+    return core.compress_payload_text(text,0.05)
+
+def store_doc(doc: dict, compress: bool=False) -> str:
+    text=json.dumps(doc,ensure_ascii=False,separators=(",",":"))
+    wrapped=_compressed_envelope(text) if compress else None
+    return keyring.encrypt(wrapped or text)
+
+
+def store_note_doc(doc: dict, compress: bool) -> tuple[str, bool]:
+    text=json.dumps(doc,ensure_ascii=False,separators=(",",":"))
+    wrapped=_compressed_envelope(text) if compress else None
+    return keyring.encrypt(wrapped or text),bool(wrapped)
+
+
+def sync_version_compression(conn, note_id: int, compress: bool) -> bool:
+    rows=conn.execute("SELECT id,payload FROM note_versions WHERE note_id=?",(note_id,)).fetchall()
+    replacements=[]
+    growth=0
+    for r in rows:
+        text=keyring.decrypt(r["payload"])
+        is_compressed=text.startswith(COMPRESSED_PREFIX)
+        if compress and not is_compressed:
+            wrapped=_compressed_envelope(text)
+            if not wrapped:
+                continue
+            replacement=keyring.encrypt(wrapped)
+        elif not compress and is_compressed:
+            replacement=keyring.encrypt(_decrypted_payload_text(r["payload"]))
+            growth+=max(0,len(replacement.encode())-len(r["payload"].encode()))
+        else:
+            continue
+        replacements.append((replacement,r["id"],r["payload"]))
+    if growth:
+        owner=conn.execute("SELECT owner_id FROM notes WHERE id=?",(note_id,)).fetchone()
+        if owner:
+            enforce_quota(conn,owner["owner_id"],growth)
+    changed=False
+    for replacement,version_id,old_payload in replacements:
+        changed |= conn.execute("UPDATE note_versions SET payload=? WHERE id=? AND payload=?",
+                                (replacement,version_id,old_payload)).rowcount==1
+    return changed
+
+
+def all_participants_archived(conn, note_id: int) -> bool:
+    row=conn.execute("SELECT COUNT(*),COALESCE(SUM(CASE WHEN archived=0 THEN 1 ELSE 0 END),0) "
+                     "FROM note_users WHERE note_id=?",(note_id,)).fetchone()
+    return bool(row and row[0]>0 and row[1]==0)
+
+
+def sync_note_compression(conn, note_id: int) -> bool:
+    """Compress only when every current participant archived the note; otherwise keep it plain."""
+    row=conn.execute("SELECT payload,payload_compressed FROM notes WHERE id=?",(note_id,)).fetchone()
+    if not row:
+        return False
+    all_archived=all_participants_archived(conn,note_id)
+    versions_changed=sync_version_compression(conn,note_id,all_archived)
+    if all_archived and not row["payload_compressed"]:
+        text=keyring.decrypt(row["payload"])
+        wrapped=_compressed_envelope(text)
+        if not wrapped:
+            return versions_changed
+        encrypted=keyring.encrypt(wrapped)
+        changed=conn.execute("UPDATE notes SET payload=?,payload_compressed=1 WHERE id=? AND payload=? "
+            "AND payload_compressed=0 AND NOT EXISTS (SELECT 1 FROM note_users nu WHERE nu.note_id=? AND nu.archived=0)",
+            (encrypted,note_id,row["payload"],note_id)).rowcount
+        return changed==1 or versions_changed
+    if not all_archived and row["payload_compressed"]:
+        text=_decrypted_payload_text(row["payload"])
+        encrypted=keyring.encrypt(text)
+        growth=max(0,len(encrypted.encode())-len(row["payload"].encode()))
+        if growth:
+            owner=conn.execute("SELECT owner_id FROM notes WHERE id=?",(note_id,)).fetchone()
+            if owner:
+                enforce_quota(conn,owner["owner_id"],growth)
+        changed=conn.execute("UPDATE notes SET payload=?,payload_compressed=0 WHERE id=? AND payload=? "
+            "AND payload_compressed=1 AND EXISTS (SELECT 1 FROM note_users nu WHERE nu.note_id=? AND nu.archived=0)",
+            (encrypted,note_id,row["payload"],note_id)).rowcount
+        return changed==1 or versions_changed
+    return versions_changed
+
+
+def compress_archived_batch(after_id: int=0, limit: int=50) -> tuple[int,int]:
+    conn=core.connect()
+    try:
+        rows=conn.execute("SELECT n.id FROM notes n WHERE n.id>? AND n.payload_compressed=0 "
+            "AND EXISTS (SELECT 1 FROM note_users nu WHERE nu.note_id=n.id) "
+            "AND NOT EXISTS (SELECT 1 FROM note_users nu WHERE nu.note_id=n.id AND nu.archived=0) "
+            "ORDER BY n.id LIMIT ?",(after_id,limit)).fetchall()
+        if not rows:
+            return after_id,0
+        last_id=rows[-1]["id"]
+        for r in rows:
+            sync_note_compression(conn,r["id"])
+        conn.commit()
+        return last_id,len(rows)
+    finally:
+        conn.close()
+
+
+async def compress_existing_archived_notes() -> None:
+    cursor=0
+    while True:
+        cursor,count=await run_in_threadpool(compress_archived_batch,cursor)
+        if count==0:
+            break
+        await asyncio.sleep(0.05)
 
 
 def user_view(row) -> dict:
@@ -406,7 +528,8 @@ def participants(conn, note_id: int) -> list[int]:
     return [r[0] for r in conn.execute("SELECT user_id FROM note_users WHERE note_id = ?", (note_id,))]
 
 
-def note_views(conn, user_id: int, note_id: int | None = None, note_ids: list[int] | None = None) -> list[dict]:
+def note_views(conn, user_id: int, note_id: int | None = None, note_ids: list[int] | None = None,
+               defer_archived_content: bool = False) -> list[dict]:
     where, params = "nu.user_id = ?", [user_id]
     sub, sub_params = "SELECT note_id FROM note_users WHERE user_id = ?", [user_id]
     if note_id is not None:
@@ -445,11 +568,13 @@ def note_views(conn, user_id: int, note_id: int | None = None, note_ids: list[in
     for r in rows:
         if r["trashed_at"] is not None and r["role"] != "owner":
             continue  # vom Inhaber gelöschte Notizen sehen Mitbearbeiter nicht mehr
-        doc = load_doc(r)
+        deferred=defer_archived_content and bool(r["archived"])
+        doc=({"title":"","body":[{"insert":"\n"}],"items":[],"is_list":False} if deferred else load_doc(r))
         out.append({
             "id": r["id"], "rev": r["rev"],
             "title": doc["title"], "body": doc["body"], "items": doc["items"], "is_list": doc["is_list"],
-            "color": r["color"], "images": images.get(r["id"], []), "members": members.get(r["id"], []),
+            "content_deferred": deferred, "compressed": bool(r["payload_compressed"]),
+            "color": r["color"], "images": [] if deferred else images.get(r["id"], []), "members": members.get(r["id"], []),
             "owner_id": r["owner_id"], "role": r["role"],
             "pinned": bool(r["pinned"]), "archived": bool(r["archived"]), "position": r["position"],
             "trashed": r["trashed_at"] is not None, "trashed_at": r["trashed_at"],
@@ -511,13 +636,13 @@ def save_version(conn, note_id: int, user_id: int, doc: dict, t: int) -> None:
                         "ORDER BY id DESC LIMIT 1", (note_id,)).fetchone()
     editors = [user_id]
     if last and t - last["updated_at"] < core.VERSION_IDLE and t - last["created_at"] < core.VERSION_WINDOW:
-        prev = json.loads(keyring.decrypt(last["payload"])).get("editors", [])
+        prev = json.loads(_decrypted_payload_text(last["payload"])).get("editors", [])
         editors = prev + [user_id] if user_id not in prev else prev
         conn.execute("UPDATE note_versions SET payload = ?, updated_at = ?, user_id = ? WHERE id = ?",
-                     (store_doc({**doc, "editors": editors}), t, user_id, last["id"]))
+                     (store_doc({**doc, "editors": editors},compress=all_participants_archived(conn,note_id)), t, user_id, last["id"]))
     else:
         conn.execute("INSERT INTO note_versions(note_id, user_id, created_at, updated_at, payload) "
-                     "VALUES (?,?,?,?,?)", (note_id, user_id, t, t, store_doc({**doc, "editors": editors})))
+                     "VALUES (?,?,?,?,?)", (note_id, user_id, t, t, store_doc({**doc, "editors": editors},compress=all_participants_archived(conn,note_id))))
         conn.execute("DELETE FROM note_versions WHERE note_id = ? AND id NOT IN (SELECT id FROM note_versions "
                      "WHERE note_id = ? ORDER BY id DESC LIMIT ?)", (note_id, note_id, core.VERSIONS_KEEP))
 
@@ -527,25 +652,25 @@ def commit_change(conn, row, user_id: int, client: str, cid: str, change: list, 
     new_doc = ot.apply_change(doc, change)
     t = core.now()
     rev = row["rev"] + 1
-    new_payload = store_doc(new_doc)
+    new_payload, compressed = store_note_doc(new_doc,all_participants_archived(conn,row["id"]))
     owner = conn.execute("SELECT owner_id,payload FROM notes WHERE id=?", (row["id"],)).fetchone()
     op_payload = keyring.encrypt(json.dumps(change, ensure_ascii=False, separators=(",", ":")))
     last = conn.execute("SELECT payload,created_at,updated_at FROM note_versions WHERE note_id=? ORDER BY id DESC LIMIT 1",
                         (row["id"],)).fetchone()
     editors=[user_id]
     if last and t-last["updated_at"] < core.VERSION_IDLE and t-last["created_at"] < core.VERSION_WINDOW:
-        editors=json.loads(keyring.decrypt(last["payload"])).get("editors",[])
+        editors=json.loads(_decrypted_payload_text(last["payload"])).get("editors",[])
         if user_id not in editors: editors=editors+[user_id]
-        version_payload=store_doc({**new_doc,"editors":editors})
+        version_payload=store_doc({**new_doc,"editors":editors},compress=all_participants_archived(conn,row["id"]))
         version_delta=len(version_payload.encode())-len(last["payload"].encode())
     else:
-        version_payload=store_doc({**new_doc,"editors":editors})
+        version_payload=store_doc({**new_doc,"editors":editors},compress=all_participants_archived(conn,row["id"]))
         version_delta=len(version_payload.encode())
     growth=(len(new_payload.encode())-len(owner["payload"].encode())
             +len(op_payload.encode())+version_delta)
     enforce_quota(conn, owner["owner_id"], max(0,growth))
-    conn.execute("UPDATE notes SET payload = ?, rev = ?, updated_at = ?, updated_by = ? WHERE id = ?",
-                 (new_payload, rev, t, user_id, row["id"]))
+    conn.execute("UPDATE notes SET payload = ?, payload_compressed = ?, rev = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+                 (new_payload,int(compressed),rev,t,user_id,row["id"]))
     conn.execute("INSERT INTO note_ops(note_id, rev, user_id, client, cid, created_at, op) VALUES (?,?,?,?,?,?,?)",
                  (row["id"], rev, user_id, client, cid, t, op_payload))
     conn.execute("DELETE FROM note_ops WHERE note_id = ? AND rev <= ?", (row["id"], rev - core.OPLOG_KEEP))
@@ -881,7 +1006,7 @@ def list_notes(offset: int | None = None, limit: int = 80, user=Depends(current_
                  (user["id"], core.now() - core.TRASH_DAYS * 86400))
     conn.commit()
     if offset is None:
-        return note_views(conn, user["id"])
+        return note_views(conn, user["id"],defer_archived_content=True)
     if offset < 0 or limit < 1 or limit > 200:
         raise HTTPException(400,"Ungültige Seitengröße")
     uid=user["id"]
@@ -890,7 +1015,7 @@ def list_notes(offset: int | None = None, limit: int = 80, user=Depends(current_
     ids=[r[0] for r in conn.execute("SELECT n.id FROM notes n JOIN note_users nu ON nu.note_id=n.id "
           "WHERE nu.user_id=? AND (n.trashed_at IS NULL OR nu.role='owner') "
           "ORDER BY nu.position DESC,n.id DESC LIMIT ? OFFSET ?",(uid,limit,offset)).fetchall()]
-    views=note_views(conn,uid,note_ids=ids)
+    views=note_views(conn,uid,note_ids=ids,defer_archived_content=True)
     by_id={v["id"]:v for v in views}
     return {"notes":[by_id[i] for i in ids if i in by_id],"total":total,
             "next_offset":offset+len(ids) if len(ids)==limit and offset+len(ids)<total else None}
@@ -927,6 +1052,7 @@ def create_note(body: NoteIn, request: Request, user=Depends(current_user), conn
             conn.execute("INSERT INTO note_users(note_id, user_id, role, position, added_at) VALUES (?,?,'editor',?,?)",
                          (nid, other, next_position(conn, other), t))
         collab = set(found)
+    sync_note_compression(conn,nid)
     save_version(conn, nid, uid, doc, t)
     conn.commit()
     publish_note(conn, nid, collab | {uid}, exclude_client=client_of(request))
@@ -958,6 +1084,8 @@ def update_note(note_id: int, body: NotePatch, request: Request, user=Depends(cu
                      (*params, note_id, uid))
     if "labels" in changes:
         set_labels(conn, uid, note_id, changes["labels"])
+    if "archived" in changes:
+        sync_note_compression(conn,note_id)
     conn.commit()
     targets = participants(conn, note_id) if shared_change else [uid]
     publish_note(conn, note_id, targets, exclude_client=client_of(request))
@@ -982,6 +1110,7 @@ def leave_note(note_id: int, request: Request, user=Depends(current_user), conn=
     if row["role"] == "owner":
         raise HTTPException(400, "Der Inhaber kann eine Notiz nicht verlassen.")
     _remove_member(conn, note_id, user["id"])
+    sync_note_compression(conn,note_id)
     conn.commit()
     hub.publish([user["id"]], {"t": "gone", "id": note_id}, exclude_client=client_of(request))
     publish_note(conn, note_id, participants(conn, note_id))
@@ -1017,6 +1146,7 @@ def set_collaborators(note_id: int, body: CollaboratorsIn, request: Request, use
                      (note_id, other, next_position(conn, other), t))
     for other in removed:
         _remove_member(conn, note_id, other)
+    sync_note_compression(conn,note_id)
     conn.commit()
     publish_note(conn, note_id, current | wanted, exclude_client=client_of(request))
     if uid in removed:
@@ -1138,7 +1268,7 @@ def list_versions(note_id: int, user=Depends(current_user), conn=Depends(get_db)
     out = []
     for r in conn.execute("SELECT id, user_id, created_at, updated_at, payload FROM note_versions "
                           "WHERE note_id = ? ORDER BY id DESC", (note_id,)):
-        ids = json.loads(keyring.decrypt(r["payload"])).get("editors") or [r["user_id"]]
+        ids = json.loads(_decrypted_payload_text(r["payload"])).get("editors") or [r["user_id"]]
         editors = [users.get(i) or {"id": i, "username": "Gelöschter Benutzer", "avatar": None} for i in ids]
         out.append({"id": r["id"], "created_at": r["created_at"], "updated_at": r["updated_at"], "editors": editors})
     return out

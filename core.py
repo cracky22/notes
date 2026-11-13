@@ -21,6 +21,7 @@ import sqlite3
 import threading
 import time
 import warnings
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -52,7 +53,7 @@ VERSIONS_KEEP = 100       # maximale Anzahl Versionen je Notiz
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_SIDE = 2560
 AVATAR_SIDE = 256
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{3,64}$")
 MIN_PASSWORD_LEN = 8
@@ -70,6 +71,27 @@ def now() -> int:
 
 def stamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+COMPRESSED_PAYLOAD_PREFIX = "zlib1:"
+
+
+def compress_payload_text(text: str, min_savings: float = 0.05) -> str | None:
+    """Zlib-Komprimiert Text nur, wenn der versionierte Textumschlag mindestens 5 % spart."""
+    if text.startswith(COMPRESSED_PAYLOAD_PREFIX):
+        return text
+    packed=zlib.compress(text.encode("utf-8"),level=6)
+    wrapped=COMPRESSED_PAYLOAD_PREFIX+base64.urlsafe_b64encode(packed).decode("ascii").rstrip("=")
+    return wrapped if len(wrapped.encode("utf-8")) <= len(text.encode("utf-8"))*(1-min_savings) else None
+
+
+def decompress_payload_text(text: str) -> str:
+    """Entpackt den internen Textumschlag; alte/unmarkierte Payloads bleiben kompatibel."""
+    if not text.startswith(COMPRESSED_PAYLOAD_PREFIX):
+        return text
+    encoded=text[len(COMPRESSED_PAYLOAD_PREFIX):]
+    raw=base64.urlsafe_b64decode(encoded+"="*(-len(encoded)%4))
+    return zlib.decompress(raw).decode("utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -124,6 +146,7 @@ CREATE TABLE IF NOT EXISTS notes (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     payload     TEXT NOT NULL,
+    payload_compressed INTEGER NOT NULL DEFAULT 0,
     color       TEXT NOT NULL DEFAULT 'default',
     rev         INTEGER NOT NULL DEFAULT 0,
     trashed_at  INTEGER,
@@ -247,6 +270,9 @@ def prepare_db(conn: sqlite3.Connection, keyring: "KeyRing | None" = None) -> No
             version = 2
         if version == 2:
             _migrate_2_to_3(conn)
+            version = 3
+        if version == 3:
+            _migrate_3_to_4(conn)
     elif version > SCHEMA_VERSION:
         raise RuntimeError("Die Datenbank stammt von einer neueren Programmversion.")
     try:
@@ -331,6 +357,20 @@ def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
         conn.rollback()
         raise
     print("Migration auf Schema v3 abgeschlossen.")
+
+
+def _migrate_3_to_4(conn: sqlite3.Connection) -> None:
+    conn.execute("BEGIN")
+    try:
+        cols={r[1] for r in conn.execute("PRAGMA table_info(notes)")}
+        if "payload_compressed" not in cols:
+            conn.execute("ALTER TABLE notes ADD COLUMN payload_compressed INTEGER NOT NULL DEFAULT 0")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '4')")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    print("Migration auf Schema v4 abgeschlossen.")
 
 
 def key_ids_in_db(conn: sqlite3.Connection) -> dict[str, int]:
