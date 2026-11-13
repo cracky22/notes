@@ -12,7 +12,7 @@ import {
 } from './state.js';
 
 const META_KEYS = ['color', 'images', 'members', 'owner_id', 'role', 'pinned', 'archived', 'position', 'trashed',
-  'trashed_at', 'labels', 'created_at', 'updated_at', 'updated_by'];
+  'trashed_at', 'labels', 'created_at', 'updated_at', 'updated_by', 'compressed'];
 const THEMES = { system: ['brightness_auto', 'Design: wie System'], light: ['light_mode', 'Design: hell'], dark: ['dark_mode', 'Design: dunkel'] };
 const URL_RE = /\bhttps?:\/\/\S+/i;
 const initialUrl = new URL(location.href);
@@ -44,6 +44,8 @@ let conn = null;
 let ready = false;
 let queue = [];
 let editor = null;          // {ed, note, modal}
+let deferredObserver = null;
+let deferredSearchTask = false;
 const composer = { expanded: false, ed: null, ns: null, meta: null };
 
 // ===========================================================================
@@ -109,16 +111,30 @@ function metaOf(view) {
 
 function upsertNote(view) {
   let n = state.notes.get(view.id);
+  const deferred = !!view.content_deferred;
+  const emptyView = deferred ? { ...view, title: '', body: [{ insert: '\n' }], items: [], is_list: false } : view;
   if (!n) {
-    n = { id: view.id, ...metaOf(view) };
-    n.ns = new NoteState(conn, view);
+    n = { id: view.id, ...metaOf(view), contentDeferred: deferred, contentLoaded: !deferred };
+    n.ns = new NoteState(conn, emptyView);
     n.ns.on(ev => { if (ev.type !== 'synced') noteChanged(n.id); if (ev.type === 'reset' && ev.lost) toast('Einige Änderungen konnten nicht synchronisiert werden.'); });
     state.notes.set(n.id, n);
   } else {
     Object.assign(n, metaOf(view));
-    if (view.rev > n.ns.rev) {
-      if (!n.ns.pending()) n.ns.reset(view);
-      else n.ns.catchup();
+    if (deferred) {
+      // List responses carry metadata only for archived notes. Keep any already-loaded body cached.
+      if (!n.contentLoaded || view.rev > n.ns.rev) {
+        n.contentDeferred = true;
+        n.contentLoaded = false;
+      }
+    } else {
+      const needsBody = !n.contentLoaded;
+      const newer = view.rev > n.ns.rev;
+      n.contentDeferred = false;
+      n.contentLoaded = true;
+      if (needsBody || newer) {
+        if (!n.ns.pending()) n.ns.reset(view);
+        else n.ns.catchup();
+      }
     }
   }
   if (activeLoadGeneration) n._loadedGeneration = activeLoadGeneration;
@@ -435,7 +451,7 @@ function applyRoute() {
 function visibleNotes() {
   const q = state.search.trim().toLocaleLowerCase();
   let list = [...state.notes.values()].filter(n => {
-    if (state.searching) return !n.trashed;
+    if (state.searching) return !n.trashed && !n.contentDeferred;
     if (state.view === 'trash') return n.trashed;
     if (n.trashed) return false;
     if (state.view === 'archive') return n.archived;
@@ -529,6 +545,7 @@ function renderSidebar() {
 }
 
 function renderMain() {
+  if (deferredObserver) { deferredObserver.disconnect(); deferredObserver = null; }
   const area = $('#notes-area');
   const notice = $('#notice');
   const before = captureLayout(area, '.note-card');
@@ -541,6 +558,13 @@ function renderMain() {
   if (state.searching && !q && !state.filter) {
     renderSearchPanel(area);
     return;
+  }
+  if (state.searching) {
+    const pending=[...state.notes.values()].filter(n=>n.contentDeferred);
+    if (pending.length) {
+      notice.append(h('div',{class:'archive-load-notice',text:`Archivierte Notizen werden für die Suche nachgeladen (${pending.length}) …`}));
+      ensureDeferredForSearch(pending);
+    }
   }
   if (!state.searching && state.view === 'trash' && [...state.notes.values()].some(n => n.trashed)) {
     notice.append(h('div', { class: 'trash-notice' },
@@ -571,6 +595,27 @@ function renderMain() {
     layoutGrid(section, grid, cards);
   }
   playLayout(area, '.note-card', before);
+  observeDeferredCards(area);
+}
+
+function observeDeferredCards(area) {
+  const cards=[...area.querySelectorAll('.note-card')].filter(c=>{
+    const n=state.notes.get(Number(c.dataset.key));
+    return n && n.contentDeferred && !n._deferredPromise;
+  });
+  if (!cards.length) return;
+  if (typeof IntersectionObserver !== 'function') {
+    cards.slice(0,12).forEach(c=>loadDeferredNote(state.notes.get(Number(c.dataset.key))));
+    return;
+  }
+  deferredObserver=new IntersectionObserver(entries=>{
+    for (const entry of entries) if (entry.isIntersecting) {
+      deferredObserver.unobserve(entry.target);
+      const n=state.notes.get(Number(entry.target.dataset.key));
+      if (n) loadDeferredNote(n);
+    }
+  },{rootMargin:'400px 0px'});
+  cards.forEach(c=>deferredObserver.observe(c));
 }
 
 function gridMetrics(width) {
@@ -648,24 +693,28 @@ function buildCard(n, list) {
     card.append(iconBtn(n.pinned && !n.archived ? 'push_pin' : 'push_pin_o', n.pinned ? 'Notiz loslösen' : 'Notiz anheften',
       e => { e.stopPropagation(); actPin([n]); }, 'pin-btn' + (n.pinned && !n.archived ? ' on' : '')));
   }
-  if (n.images.length) card.append(imageGrid(n.images, 'card-images'));
-  const hasTitle = doc.title.trim() !== '';
-  if (hasTitle) card.append(h('div', { class: 'note-title', text: doc.title }));
-  if (doc.is_list && doc.items.length) {
-    card.append(checklistPreview(n));
-  } else if (!doc.is_list && doc.body.length() > 1) {
-    const body = h('div', { class: 'note-body' });
-    const text = doc.body.text();
-    const big = !hasTitle && !n.images.length && text.length <= 60 && text.split('\n').length <= 3 && !doc.body.ops.some(o => o.attributes);
-    if (big) body.classList.add('big');
-    body.innerHTML = renderHTML(doc.body, { rich: true, links: true, maxChars: 1500 });
-    for (const a of body.querySelectorAll('a')) a.addEventListener('click', e => e.stopPropagation());
-    card.append(body);
-  } else if (!hasTitle && !n.images.length) {
-    card.append(h('div', { class: 'note-body empty-note', text: 'Leere Notiz' }));
+  if (n.contentDeferred) {
+    card.append(h('div', { class: 'deferred-note', role: 'status', text: n._deferredPromise ? 'Archivnotiz wird geladen …' : 'Archivnotiz wird bei Bedarf vom Server geladen' }));
+  } else {
+    if (n.images.length) card.append(imageGrid(n.images, 'card-images'));
+    const hasTitle = doc.title.trim() !== '';
+    if (hasTitle) card.append(h('div', { class: 'note-title', text: doc.title }));
+    if (doc.is_list && doc.items.length) {
+      card.append(checklistPreview(n));
+    } else if (!doc.is_list && doc.body.length() > 1) {
+      const body = h('div', { class: 'note-body' });
+      const text = doc.body.text();
+      const big = !hasTitle && !n.images.length && text.length <= 60 && text.split('\n').length <= 3 && !doc.body.ops.some(o => o.attributes);
+      if (big) body.classList.add('big');
+      body.innerHTML = renderHTML(doc.body, { rich: true, links: true, maxChars: 1500 });
+      for (const a of body.querySelectorAll('a')) a.addEventListener('click', e => e.stopPropagation());
+      card.append(body);
+    } else if (!hasTitle && !n.images.length) {
+      card.append(h('div', { class: 'note-body empty-note', text: 'Leere Notiz' }));
+    }
+    const preview = linkPreview(n);
+    if (preview) card.append(preview);
   }
-  const preview = linkPreview(n);
-  if (preview) card.append(preview);
   const chips = D.labelChips(n.labels, n.trashed ? null : id => patchNote(n, { labels: n.labels.filter(x => x !== id) }));
   const others = n.members.filter(m => m.id !== state.user.id);
   if (chips || others.length) {
@@ -682,6 +731,7 @@ function buildCard(n, list) {
   card.addEventListener('click', e => {
     if (e.target.closest('button, .chip, a')) return;
     if (state.selected.size) { toggleSelect(n.id, e.shiftKey); return; }
+    if (n.contentDeferred) { loadDeferredNote(n,true,card,true); return; }
     openEditor(n, card);
   });
   card.addEventListener('focus', () => { state.focusedId = n.id; });
@@ -721,7 +771,7 @@ function cardToolbar(n) {
     { label: n.role === 'owner' ? 'Notiz löschen' : 'Notiz entfernen', action: () => actTrash([n]) },
     { label: n.labels.length ? 'Label ändern' : 'Label hinzufügen', action: () => openPopover(more, D.labelPicker(() => n.labels, ids => patchNote(n, { labels: ids }))) },
     { label: 'Kopie erstellen', action: () => actCopy([n]) },
-    { label: n.ns.doc.is_list ? 'Kästchen ausblenden' : 'Kästchen anzeigen', action: () => convertFromCard(n) },
+    { label: n.ns.doc.is_list ? 'Kästchen ausblenden' : 'Kästchen anzeigen', action: () => n.contentDeferred ? loadDeferredNote(n).then(() => convertFromCard(n)) : convertFromCard(n) },
     { label: 'Versionsverlauf', action: () => D.openVersions(n) },
   ]))), '', 18);
   bar.append(
@@ -912,10 +962,11 @@ async function closeComposer() {
 function cardOf(n) { return document.querySelector(`#notes-area .note-card[data-key="${n.id}"]`); }
 
 function openEditor(n, cardEl = null) {
+  if (n.contentDeferred) { loadDeferredNote(n,true,cardEl,true); return; }
   closePopover();
   if (composer.expanded) closeComposer();
   if (editor) editor.modal.close();
-  const card = cardEl || cardOf(n);
+  const card = cardEl && cardEl.isConnected ? cardEl : cardOf(n);
   const from = card ? card.getBoundingClientRect() : null;
   const actions = {
     pin: () => actPin([n]),
@@ -1134,9 +1185,47 @@ async function fetchNote(id, reset = false) {
   try {
     const view = await api('GET', `/api/notes/${id}`);
     const n = state.notes.get(id);
-    if (n && reset) { Object.assign(n, metaOf(view)); n.ns.reset(view); scheduleRender(); } else upsertNote(view);
+    if (n && reset) { Object.assign(n, metaOf(view)); n.contentDeferred=false; n.contentLoaded=true; n.ns.reset(view); scheduleRender(); } else upsertNote(view);
   } catch (e) {
     if (e.status === 404) removeNote(id); else handleError(e);
+  }
+}
+
+async function loadDeferredNote(n, openAfter=false, cardEl=null, force=false) {
+  if (!n) return;
+  if (!n.contentDeferred) { if (openAfter) openEditor(n,cardEl); return; }
+  if (!force && n._deferredRetryAt && n._deferredRetryAt>Date.now()) return;
+  if (!n._deferredPromise) {
+    n._deferredPromise=(async()=>{
+      try {
+        const view=await api('GET',`/api/notes/${n.id}`);
+        upsertNote(view);
+        n._deferredRetryAt=0;
+      } catch(e) {
+        if (e.status===404) removeNote(n.id);
+        else if (!(e instanceof AuthError)) { n._deferredRetryAt=Date.now()+8000; handleError(e); }
+      } finally {
+        n._deferredPromise=null;
+        scheduleRender();
+      }
+    })();
+  }
+  await n._deferredPromise;
+  if (openAfter && !n.contentDeferred) openEditor(n,cardEl);
+}
+
+async function ensureDeferredForSearch(pending) {
+  if (deferredSearchTask) return;
+  deferredSearchTask=true;
+  try {
+    const notes=pending.filter(n=>!n._deferredPromise && (!n._deferredRetryAt || n._deferredRetryAt<=Date.now()));
+    for (let i=0;i<notes.length;i+=6) {
+      if (!state.searching) break;
+      await Promise.all(notes.slice(i,i+6).map(n=>loadDeferredNote(n)));
+    }
+  } finally {
+    deferredSearchTask=false;
+    scheduleRender();
   }
 }
 

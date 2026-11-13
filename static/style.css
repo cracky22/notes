@@ -790,3 +790,7 @@ body.selecting .card-toolbar { opacity: 0 !important; pointer-events: none; }
 .session-copy { display:flex; flex-direction:column; gap:4px; min-width:0; }.session-copy strong { font-size:13px; overflow-wrap:anywhere; }.session-copy small { color:var(--fg-2); font-size:11px; }
 .text-btn.danger { color:var(--error, #b3261e); }.magic-url { width:100%; margin:12px 0; padding:11px; border:1px solid var(--border); border-radius:4px; background:var(--bg); color:var(--fg); }
 @media (max-width:520px) { .login-actions { flex-direction:column; align-items:stretch; }.login-actions .text-btn { justify-content:center; } }
+
+/* ---------- Archivierte Notizen: Inhalt bei Bedarf nachladen ---------- */
+.deferred-note { min-height:58px; display:flex; align-items:center; padding:14px 12px; color:var(--fg-2); font-size:13px; border-top:1px solid var(--border); }
+.archive-load-notice { max-width:760px; margin:0 auto 14px; padding:10px 14px; color:var(--fg-2); font-size:13px; background:var(--hover-soft); border-radius:6px; }
