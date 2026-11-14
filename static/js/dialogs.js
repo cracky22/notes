@@ -588,12 +588,11 @@ export async function openMagicLinksDialog() {
       const copy = h('button', { type: 'button', class: 'text-btn primary', text: 'Link kopieren', onclick: async () => {
         try { await navigator.clipboard.writeText(item.url); copy.textContent = 'Kopiert'; } catch { field.select(); document.execCommand('copy'); copy.textContent = 'Kopiert'; }
       } });
-      openModal(h('div', { class: 'dialog' }, h('h3', { class: 'dialog-title', text: 'Link sicher aufbewahren' }),
+      const reveal = openModal(h('div', { class: 'dialog' }, h('h3', { class: 'dialog-title', text: 'Link sicher aufbewahren' }),
         h('p', { class: 'muted', text: 'Der Link wird nur jetzt vollständig angezeigt. Er ist 30 Tage gültig und gewährt direkten Kontozugriff.' }),
         field, h('div', { class: 'dialog-actions' }, copy,
           h('button', { type: 'button', class: 'text-btn', text: 'Schließen', onclick: () => { reveal.close(); draw(); } }))),
         { className: 'small', label: 'Neuer Anmeldelink' });
-      const reveal = modals[modals.length - 1];
       field.focus(); field.select();
     } catch (e) { toast(e.message); }
   });
