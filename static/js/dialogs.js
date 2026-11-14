@@ -493,13 +493,25 @@ export function openQrLogin() {
       iconBtn('close', 'Schließen', () => m.close())),
     image,
     status,
-    h('p', { class: 'muted', text: 'Scanne den Code mit einem bereits angemeldeten Gerät und bestätige die Anmeldung dort.' }),
+    h('p', { class: 'muted', text: 'Scanne den Code mit der Kamera-App eines bereits angemeldeten Geräts (z. B. deines Handys). Es öffnet sich die Notizen-App, dort tippst du auf „Gerät freigeben“.' }),
     h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'text-btn', onclick: () => m.close() }, 'Abbrechen')));
   const m = openModal(content, { className: 'small', label: 'Mit Gerät anmelden', onClose: () => clearInterval(timer) });
   (async () => {
     try {
       const data = await api('POST', '/api/device-login/challenge');
       challenge = data.challenge;
+      image.addEventListener('error', async () => {
+        image.classList.add('hidden');
+        clearInterval(timer);
+        let msg = 'Der QR-Code konnte nicht geladen werden.';
+        try {
+          const r = await fetch(`api/device-login/qr?challenge=${encodeURIComponent(challenge)}`);
+          const ct = r.headers.get('content-type') || '';
+          if (ct.includes('json')) msg = (await r.json()).detail || msg;
+          else if (!r.ok) msg += ` (Serverantwort ${r.status})`;
+        } catch { /* Netzwerkfehler: Standardtext */ }
+        status.textContent = msg;
+      }, { once: true });
       image.src = `api/device-login/qr?challenge=${encodeURIComponent(challenge)}`;
       image.classList.remove('hidden');
       status.textContent = 'Warte auf Bestätigung auf deinem anderen Gerät …';
