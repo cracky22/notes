@@ -1889,13 +1889,15 @@ async def websocket(ws: WebSocket):
                 try:
                     valid = db.execute("SELECT 1 FROM sessions WHERE token_hash = ? AND expires_at > ?",
                                        (conn.token_hash, core.now())).fetchone()
+                    if valid:
+                        db.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?",
+                                   (core.now(), conn.token_hash))
+                        db.commit()
                 finally:
                     db.close()
                 if not valid:
                     await ws.close(code=4401)
                     break
-                db.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?",(core.now(),conn.token_hash))
-                db.commit()
                 conn.checked = time.monotonic()
             try:
                 msg = json.loads(text)
