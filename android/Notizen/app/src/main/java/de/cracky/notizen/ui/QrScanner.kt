@@ -1,4 +1,4 @@
-package de.brainlab.notizen.ui
+package de.cracky.notizen.ui
 
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis

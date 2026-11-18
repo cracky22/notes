@@ -1,14 +1,14 @@
-package de.brainlab.notizen
+package de.cracky.notizen
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.gson.JsonObject
-import de.brainlab.notizen.data.ApiException
-import de.brainlab.notizen.model.NoteData
-import de.brainlab.notizen.model.NoteItem
-import de.brainlab.notizen.model.UserData
-import de.brainlab.notizen.model.makeItem
+import de.cracky.notizen.data.ApiException
+import de.cracky.notizen.model.NoteData
+import de.cracky.notizen.model.NoteItem
+import de.cracky.notizen.model.UserData
+import de.cracky.notizen.model.makeItem
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow

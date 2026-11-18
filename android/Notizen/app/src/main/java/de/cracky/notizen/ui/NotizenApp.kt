@@ -1,4 +1,4 @@
-package de.brainlab.notizen.ui
+package de.cracky.notizen.ui
 
 import android.Manifest
 import android.content.pm.PackageManager
@@ -100,16 +100,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.core.content.ContextCompat
-import de.brainlab.notizen.NotesViewModel
-import de.brainlab.notizen.model.NoteData
-import de.brainlab.notizen.model.NoteItem
-import de.brainlab.notizen.model.makeItem
+import de.cracky.notizen.NotesViewModel
+import de.cracky.notizen.model.NoteData
+import de.cracky.notizen.model.NoteItem
+import de.cracky.notizen.model.makeItem
 import kotlinx.coroutines.launch
 
 @Composable
 fun NotizenApp(vm: NotesViewModel = viewModel()) {
     val state by vm.state.collectAsState()
-    var lastEditor by remember { mutableStateOf<de.brainlab.notizen.EditorModel?>(null) }
+    var lastEditor by remember { mutableStateOf<de.cracky.notizen.EditorModel?>(null) }
     LaunchedEffect(Unit) { vm.bootstrap() }
     LaunchedEffect(state.editor) { state.editor?.let { lastEditor = it } }
     val screen = when {
@@ -187,7 +187,7 @@ private fun LoginScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun HomeScreen(state: de.brainlab.notizen.AppState, vm: NotesViewModel) {
+private fun HomeScreen(state: de.cracky.notizen.AppState, vm: NotesViewModel) {
     var showCreate by remember { mutableStateOf(false) }
     var showScanner by remember { mutableStateOf(false) }
     var menuNote by remember { mutableStateOf<NoteData?>(null) }

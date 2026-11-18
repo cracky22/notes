@@ -1,7 +1,7 @@
-package de.brainlab.notizen
+package de.cracky.notizen
 
 import android.app.Application
-import de.brainlab.notizen.data.NotesRepository
+import de.cracky.notizen.data.NotesRepository
 
 class NotizenApplication : Application() {
     lateinit var repository: NotesRepository

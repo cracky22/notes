@@ -6,11 +6,11 @@ plugins {
 }
 
 android {
-    namespace = "de.brainlab.notizen"
+    namespace = "de.cracky.notizen"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "de.brainlab.notizen"
+        applicationId = "de.cracky.notizen"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

@@ -1,4 +1,4 @@
-package de.brainlab.notizen.model
+package de.cracky.notizen.model
 
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
