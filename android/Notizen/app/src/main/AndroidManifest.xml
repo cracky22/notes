@@ -1,14 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.CAMERA" />
-    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+
     <application
         android:name=".NotizenApplication"
         android:allowBackup="false"
         android:label="Notizen"
         android:usesCleartextTraffic="false"
-        android:theme="@style/Theme.Notizen">
+        android:theme="@style/Theme.Notizen"
+        tools:replace="android:usesCleartextTraffic">
+        
         <activity
             android:name=".MainActivity"
             android:exported="true">
