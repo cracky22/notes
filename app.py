@@ -40,6 +40,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 import core
+import ocr
 import ot
 import search_index as sidx
 
@@ -52,6 +53,7 @@ CLIENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 COLORS = {"default", "red", "orange", "yellow", "green", "teal", "blue",
           "darkblue", "purple", "pink", "brown", "gray"}
 MAX_IMAGES_PER_NOTE = 50
+MAX_PDFS_PER_NOTE = 20
 
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +239,107 @@ async def index_worker() -> None:
             pass
 
 
+# --------------------------------------------------------------------------- #
+# OCR-Worker: erkennt Text in neuen Bildern und PDFs (Warteschlange = blobs.ocr_state='pending')
+# --------------------------------------------------------------------------- #
+_ocr_wakeup: asyncio.Event | None = None
+_ocr_stop = threading.Event()
+
+
+def wake_ocr() -> None:
+    if hub.loop is not None and _ocr_wakeup is not None:
+        hub.loop.call_soon_threadsafe(_ocr_wakeup.set)
+
+
+def _ocr_finish(conn, job, *, text: str | None, new_pdf: bytes | None, pages: int, state: str) -> None:
+    """Schreibt das Ergebnis (nur, wenn der Anhang inzwischen nicht gelöscht wurde) und stößt die Indexierung an."""
+    conn.execute("BEGIN IMMEDIATE")
+    still = conn.execute("SELECT 1 FROM blobs WHERE id=? AND ocr_state='pending'", (job["id"],)).fetchone()
+    if not still:
+        conn.rollback()
+        return
+    enc_text = keyring.encrypt(core.compress_payload_text(text, 0.05) or text) if text else None
+    conn.execute("UPDATE blobs SET ocr_text=?, ocr_state=? WHERE id=?", (enc_text, state, job["id"]))
+    if new_pdf is not None:
+        grow = len(new_pdf) - job["size"]
+        fits = True
+        if grow > 0:
+            try:
+                enforce_quota(conn, job["owner_id"], grow)
+            except HTTPException:
+                fits = False   # Kontingent erreicht: Original behalten, erkannter Text bleibt durchsuchbar
+        if fits:
+            kid, blob = keyring.encrypt_bytes(new_pdf)
+            conn.execute("UPDATE blobs SET data=?, key_id=?, size=?, pages=? WHERE id=?",
+                         (blob, kid, len(new_pdf), pages, job["id"]))
+    sidx.mark_dirty(conn, job["note_id"])
+    conn.commit()
+    publish_note(conn, job["note_id"], participants(conn, job["note_id"]))
+
+
+def run_ocr_job() -> str:
+    """Verarbeitet den ältesten wartenden Anhang. Rückgabe: 'worked', 'idle' oder 'unavailable'."""
+    if not ocr.available():
+        return "unavailable"
+    conn = core.connect()
+    try:
+        job = conn.execute("SELECT id, note_id, kind, owner_id, size, key_id, data FROM blobs "
+                           "WHERE ocr_state='pending' AND kind IN ('image','pdf') ORDER BY id LIMIT 1").fetchone()
+        if not job:
+            return "idle"
+        try:
+            raw = keyring.decrypt_bytes(job["key_id"], job["data"])
+            if job["kind"] == "pdf":
+                new_pdf, text, pages, scanned = ocr.ocr_pdf(raw, _ocr_stop.is_set)
+                log.info("OCR PDF %s: %s Seiten, %s per Texterkennung", job["id"], pages, scanned)
+            else:
+                new_pdf, pages = None, 0
+                text = ocr.ocr_image(raw)
+        except ocr.OcrAborted:
+            return "idle"
+        except ocr.OcrUnavailable:
+            return "unavailable"
+        except Exception as exc:  # noqa: BLE001  (auch Entschlüsselungsfehler: nicht endlos wiederholen)
+            log.warning("OCR für Anhang %s fehlgeschlagen: %s", job["id"], exc)
+            _ocr_finish(conn, job, text=None, new_pdf=None, pages=0, state="failed")
+            return "worked"
+        _ocr_finish(conn, job, text=text, new_pdf=new_pdf, pages=pages, state="done")
+        wake_indexer()
+        return "worked"
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+async def ocr_worker() -> None:
+    global _ocr_wakeup
+    _ocr_wakeup = asyncio.Event()
+    warned = False
+    while not _ocr_stop.is_set():
+        wait = 15.0
+        try:
+            status = await run_in_threadpool(run_ocr_job)
+            if status == "worked":
+                warned = False
+                continue
+            if status == "unavailable":
+                wait = 60.0
+                if not warned:
+                    log.warning("Tesseract nicht gefunden – OCR pausiert (Anhänge bleiben 'ausstehend').")
+                    warned = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("OCR-Worker")
+        _ocr_wakeup.clear()
+        try:
+            await asyncio.wait_for(_ocr_wakeup.wait(), timeout=wait)
+        except asyncio.TimeoutError:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     preflight()
@@ -244,11 +347,14 @@ async def lifespan(_app: FastAPI):
     _index_stop.clear()
     compressor = asyncio.create_task(compress_existing_archived_notes())
     indexer = asyncio.create_task(index_worker())
+    _ocr_stop.clear()
+    ocr_task = asyncio.create_task(ocr_worker())
     try:
         yield
     finally:
         _index_stop.set()
-        for task in (compressor, indexer):
+        _ocr_stop.set()
+        for task in (compressor, indexer, ocr_task):
             task.cancel()
             try:
                 await task
@@ -270,11 +376,11 @@ async def security_middleware(request: Request, call_next):
     response = await call_next(request)
     host = request.headers.get("host", "")
     ws_src = f" ws://{host} wss://{host}" if re.fullmatch(r"[A-Za-z0-9.\-:\[\]]+", host) else ""
-    response.headers["Content-Security-Policy"] = (
+    response.headers.setdefault("Content-Security-Policy", (
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
         f"connect-src 'self'{ws_src}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; "
         "object-src 'none'"
-    )
+    ))
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -623,6 +729,12 @@ def note_views(conn, user_id: int, note_id: int | None = None, note_ids: list[in
             f"SELECT id, note_id, width, height FROM blobs WHERE kind = 'image' AND note_id IN ({sub}) "
             f"ORDER BY id", sub_params):
         images[r["note_id"]].append({"id": r["id"], "w": r["width"], "h": r["height"]})
+    pdfs: dict[int, list] = defaultdict(list)
+    for r in conn.execute(
+            f"SELECT id, note_id, name, size, pages, ocr_state FROM blobs WHERE kind = 'pdf' AND note_id IN ({sub}) "
+            f"ORDER BY id", sub_params):
+        pdfs[r["note_id"]].append({"id": r["id"], "name": keyring.decrypt(r["name"]) if r["name"] else "Dokument.pdf",
+                                   "size": r["size"], "pages": r["pages"], "ocr": r["ocr_state"]})
     labels: dict[int, list] = defaultdict(list)
     for r in conn.execute(
             f"SELECT nl.note_id, nl.label_id FROM note_labels nl JOIN labels l ON l.id = nl.label_id "
@@ -638,7 +750,8 @@ def note_views(conn, user_id: int, note_id: int | None = None, note_ids: list[in
             "id": r["id"], "rev": r["rev"],
             "title": doc["title"], "body": doc["body"], "items": doc["items"], "is_list": doc["is_list"],
             "content_deferred": deferred, "compressed": bool(r["payload_compressed"]),
-            "color": r["color"], "images": [] if deferred else images.get(r["id"], []), "members": members.get(r["id"], []),
+            "color": r["color"], "images": [] if deferred else images.get(r["id"], []),
+            "pdfs": [] if deferred else pdfs.get(r["id"], []), "members": members.get(r["id"], []),
             "owner_id": r["owner_id"], "role": r["role"],
             "pinned": bool(r["pinned"]), "archived": bool(r["archived"]), "position": r["position"],
             "trashed": r["trashed_at"] is not None, "trashed_at": r["trashed_at"],
@@ -1268,7 +1381,7 @@ def copy_note(note_id: int, request: Request, user=Depends(current_user), conn=D
     row = member_row(conn, uid, note_id)
     doc = load_doc(row)
     payload=store_doc(doc)
-    copy_bytes=conn.execute("SELECT COALESCE(SUM(size),0) FROM blobs WHERE note_id=? AND kind='image'",(note_id,)).fetchone()[0]
+    copy_bytes=conn.execute("SELECT COALESCE(SUM(size),0) FROM blobs WHERE note_id=? AND kind IN ('image','pdf')",(note_id,)).fetchone()[0]
     version_size=len(store_doc({**doc,"editors":[uid]}).encode())
     enforce_quota(conn,uid,len(payload.encode())+version_size+copy_bytes)
     cur = conn.execute("INSERT INTO notes(owner_id, payload, color, rev, created_at, updated_at, updated_by) "
@@ -1278,13 +1391,15 @@ def copy_note(note_id: int, request: Request, user=Depends(current_user), conn=D
                  (nid, uid, next_position(conn, uid), t))
     conn.execute("INSERT INTO note_labels(note_id, label_id) SELECT ?, nl.label_id FROM note_labels nl "
                  "JOIN labels l ON l.id = nl.label_id WHERE nl.note_id = ? AND l.user_id = ?", (nid, note_id, uid))
-    conn.execute("INSERT INTO blobs(owner_id, note_id, kind, mime, width, height, size, key_id, data, created_at) "
-                 "SELECT ?, ?, kind, mime, width, height, size, key_id, data, ? FROM blobs "
-                 "WHERE note_id = ? AND kind = 'image' ORDER BY id", (uid, nid, t, note_id))
+    conn.execute("INSERT INTO blobs(owner_id, note_id, kind, mime, width, height, size, key_id, data, created_at, "
+                 "name, ocr_text, ocr_state, pages) "
+                 "SELECT ?, ?, kind, mime, width, height, size, key_id, data, ?, name, ocr_text, ocr_state, pages "
+                 "FROM blobs WHERE note_id = ? AND kind IN ('image', 'pdf') ORDER BY id", (uid, nid, t, note_id))
     save_version(conn, nid, uid, doc, t)
     sidx.mark_dirty(conn, nid)
     conn.commit()
     wake_indexer()
+    wake_ocr()
     publish_note(conn, nid, [uid], exclude_client=client_of(request))
     return one_view(conn, uid, nid)
 
@@ -1340,10 +1455,11 @@ async def upload_image(note_id: int, request: Request, user=Depends(current_user
     kid, blob = keyring.encrypt_bytes(out)
     t = core.now()
     cur = conn.execute("INSERT INTO blobs(owner_id, note_id, kind, mime, width, height, size, key_id, data, "
-                       "created_at) VALUES (?,?,'image',?,?,?,?,?,?,?)",
+                       "created_at, ocr_state) VALUES (?,?,'image',?,?,?,?,?,?,?,'pending')",
                        (user["id"], note_id, mime, w, h, len(out), kid, blob, t))
     conn.execute("UPDATE notes SET updated_at = ?, updated_by = ? WHERE id = ?", (t, user["id"], note_id))
     conn.commit()
+    wake_ocr()
     publish_note(conn, note_id, participants(conn, note_id), exclude_client=client_of(request))
     return {"id": cur.lastrowid, "w": w, "h": h}
 
@@ -1352,7 +1468,9 @@ async def upload_image(note_id: int, request: Request, user=Depends(current_user
 def delete_image(note_id: int, image_id: int, request: Request, user=Depends(current_user), conn=Depends(get_db)):
     member_row(conn, user["id"], note_id)
     conn.execute("DELETE FROM blobs WHERE id = ? AND note_id = ? AND kind = 'image'", (image_id, note_id))
+    sidx.mark_dirty(conn, note_id)   # erkannter Text des Bildes verschwindet aus der Suche
     conn.commit()
+    wake_indexer()
     publish_note(conn, note_id, participants(conn, note_id), exclude_client=client_of(request))
     return Response(status_code=204)
 
@@ -1366,6 +1484,76 @@ def get_image(image_id: int, user=Depends(current_user), conn=Depends(get_db)):
         raise HTTPException(404, "Bild nicht gefunden")
     return Response(keyring.decrypt_bytes(row["key_id"], row["data"]), media_type=row["mime"],
                     headers={"Cache-Control": "private, max-age=31536000, immutable"})
+
+
+# --------------------------------------------------------------------------- #
+# Routen: PDF-Anhänge (mit OCR im Hintergrund)
+# --------------------------------------------------------------------------- #
+def clean_filename(name: str) -> str:
+    name = re.sub(r"[\x00-\x1f\x7f/\\]", "", name or "").strip()[:120]
+    if not name:
+        return "Dokument.pdf"
+    return name if name.lower().endswith(".pdf") else name + ".pdf"
+
+
+@app.post("/api/notes/{note_id}/pdfs", status_code=201)
+async def upload_pdf(note_id: int, request: Request, name: str = "Dokument.pdf",
+                     user=Depends(current_user), conn=Depends(get_db)):
+    row = member_row(conn, user["id"], note_id)
+    if row["trashed_at"] is not None:
+        raise HTTPException(400, "Notizen im Papierkorb können nicht bearbeitet werden.")
+    count = conn.execute("SELECT COUNT(*) FROM blobs WHERE note_id = ? AND kind = 'pdf'", (note_id,)).fetchone()[0]
+    if count >= MAX_PDFS_PER_NOTE:
+        raise HTTPException(400, f"Maximal {MAX_PDFS_PER_NOTE} PDF-Dateien pro Notiz.")
+    data = await read_limited(request, core.MAX_PDF_BYTES)
+    try:
+        pages = await run_in_threadpool(ocr.check_pdf, data)
+    except ocr.OcrError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    enforce_quota(conn, user["id"], len(data))
+    fname = clean_filename(name)
+    kid, blob = keyring.encrypt_bytes(data)
+    t = core.now()
+    cur = conn.execute("INSERT INTO blobs(owner_id, note_id, kind, mime, width, height, size, key_id, data, "
+                       "created_at, name, ocr_state, pages) "
+                       "VALUES (?,?,'pdf','application/pdf',0,0,?,?,?,?,?,'pending',?)",
+                       (user["id"], note_id, len(data), kid, blob, t, keyring.encrypt(fname), pages))
+    conn.execute("UPDATE notes SET updated_at = ?, updated_by = ? WHERE id = ?", (t, user["id"], note_id))
+    sidx.mark_dirty(conn, note_id)   # Dateiname sofort suchbar, Inhalt nach der Texterkennung
+    conn.commit()
+    wake_indexer()
+    wake_ocr()
+    publish_note(conn, note_id, participants(conn, note_id), exclude_client=client_of(request))
+    return {"id": cur.lastrowid, "name": fname, "size": len(data), "pages": pages, "ocr": "pending"}
+
+
+@app.delete("/api/notes/{note_id}/pdfs/{pdf_id}", status_code=204)
+def delete_pdf(note_id: int, pdf_id: int, request: Request, user=Depends(current_user), conn=Depends(get_db)):
+    member_row(conn, user["id"], note_id)
+    conn.execute("DELETE FROM blobs WHERE id = ? AND note_id = ? AND kind = 'pdf'", (pdf_id, note_id))
+    sidx.mark_dirty(conn, note_id)
+    conn.commit()
+    wake_indexer()
+    publish_note(conn, note_id, participants(conn, note_id), exclude_client=client_of(request))
+    return Response(status_code=204)
+
+
+@app.get("/api/pdfs/{pdf_id}")
+def get_pdf(pdf_id: int, user=Depends(current_user), conn=Depends(get_db)):
+    row = conn.execute(
+        "SELECT b.key_id, b.data, b.name FROM blobs b JOIN note_users nu ON nu.note_id = b.note_id "
+        "WHERE b.id = ? AND b.kind = 'pdf' AND nu.user_id = ?", (pdf_id, user["id"])).fetchone()
+    if not row:
+        raise HTTPException(404, "PDF nicht gefunden")
+    fname = keyring.decrypt(row["name"]) if row["name"] else "Dokument.pdf"
+    from urllib.parse import quote
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", fname) or "Dokument.pdf"
+    return Response(keyring.decrypt_bytes(row["key_id"], row["data"]), media_type="application/pdf", headers={
+        "Content-Disposition": f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(fname)}",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; "
+                                   "object-src 'self'; frame-ancestors 'none'",
+        "Cache-Control": "private, no-cache",
+    })
 
 
 # --------------------------------------------------------------------------- #

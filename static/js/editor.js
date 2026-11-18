@@ -8,6 +8,8 @@
  */
 import { Delta, Attr } from './delta.js';
 
+const isAttachable = f => f.type.startsWith('image/') || f.type === 'application/pdf' || /\.pdf$/i.test(f.name || '');
+
 const BLOCK_TAGS = new Set(['DIV', 'P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'UL', 'OL', 'BLOCKQUOTE',
   'PRE', 'TABLE', 'TR', 'SECTION', 'ARTICLE', 'HEADER', 'FOOTER']);
 const INLINE = ['bold', 'italic', 'underline'];
@@ -489,7 +491,7 @@ export class TextField {
     el.addEventListener('paste', e => this.onPaste(e));
     el.addEventListener('drop', e => {
       if (this.readOnly) return;
-      const files = [...(e.dataTransfer && e.dataTransfer.files || [])].filter(f => f.type.startsWith('image/'));
+      const files = [...(e.dataTransfer && e.dataTransfer.files || [])].filter(isAttachable);
       if (files.length && this.opts.onFiles) { e.preventDefault(); e.stopPropagation(); this.opts.onFiles(files); return; }
       e.preventDefault();
       const text = e.dataTransfer && e.dataTransfer.getData('text/plain');
@@ -529,7 +531,7 @@ export class TextField {
     if (this.readOnly) { e.preventDefault(); return; }
     const cd = e.clipboardData;
     if (!cd) return;
-    const files = [...cd.files || []].filter(f => f.type.startsWith('image/'));
+    const files = [...cd.files || []].filter(isAttachable);
     if (files.length && this.opts.onFiles) {
       e.preventDefault();
       this.opts.onFiles(files);

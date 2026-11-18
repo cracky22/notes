@@ -53,7 +53,9 @@ VERSIONS_KEEP = 100       # maximale Anzahl Versionen je Notiz
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_SIDE = 2560
 AVATAR_SIDE = 256
-SCHEMA_VERSION = 6
+MAX_PDF_BYTES = 40 * 1024 * 1024
+MAX_PDF_PAGES = 150
+SCHEMA_VERSION = 7
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{3,64}$")
 MIN_PASSWORD_LEN = 8
@@ -62,7 +64,7 @@ MAX_PASSWORD_LEN = 1024
 # Textspalten mit verschlüsseltem Inhalt "<schlüssel-id>:<daten>" (für Rotation & Prüfungen)
 ENCRYPTED_COLUMNS = (("notes", "payload"), ("labels", "name"), ("note_ops", "op"),
                      ("note_versions", "payload"), ("search_entries", "payload"),
-                     ("search_index", "token_key_enc"))
+                     ("search_index", "token_key_enc"), ("blobs", "name"), ("blobs", "ocr_text"))
 # Binärdaten (Bilder, Profilbilder) stehen in blobs.data, die Schlüssel-ID in blobs.key_id
 
 
@@ -232,19 +234,25 @@ CREATE TABLE IF NOT EXISTS search_dirty (
     marked_at INTEGER NOT NULL
 );
 
--- Bilder und Profilbilder (data verschlüsselt: nonce || ciphertext || tag)
+-- Bilder, PDF-Dateien und Profilbilder (data verschlüsselt: nonce || ciphertext || tag)
+-- name/ocr_text: mit dem Schlüsselring verschlüsselte Texte (Dateiname, erkannter Text);
+-- ocr_state: none | pending | done | failed
 CREATE TABLE IF NOT EXISTS blobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
     note_id     INTEGER REFERENCES notes(id) ON DELETE CASCADE,
-    kind        TEXT NOT NULL CHECK (kind IN ('image', 'avatar')),
+    kind        TEXT NOT NULL CHECK (kind IN ('image', 'avatar', 'pdf')),
     mime        TEXT NOT NULL,
     width       INTEGER NOT NULL,
     height      INTEGER NOT NULL,
     size        INTEGER NOT NULL,
     key_id      TEXT NOT NULL,
     data        BLOB NOT NULL,
-    created_at  INTEGER NOT NULL
+    created_at  INTEGER NOT NULL,
+    name        TEXT,
+    ocr_text    TEXT,
+    ocr_state   TEXT NOT NULL DEFAULT 'none',
+    pages       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_blobs_note ON blobs(note_id);
 
@@ -292,6 +300,7 @@ def prepare_db(conn: sqlite3.Connection, keyring: "KeyRing | None" = None) -> No
     version = schema_version(conn)
     if version == 0:
         conn.executescript(SCHEMA)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_blobs_ocr ON blobs(ocr_state, id)")
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
         conn.commit()
     elif version < SCHEMA_VERSION:
@@ -318,6 +327,9 @@ def prepare_db(conn: sqlite3.Connection, keyring: "KeyRing | None" = None) -> No
             version = 5
         if version == 5:
             _migrate_5_to_6(conn)
+            version = 6
+        if version == 6:
+            _migrate_6_to_7(conn)
     elif version > SCHEMA_VERSION:
         raise RuntimeError("Die Datenbank stammt von einer neueren Programmversion.")
     try:
@@ -448,6 +460,41 @@ def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
     print("Migration auf Schema v6 abgeschlossen.")
 
 
+def _migrate_6_to_7(conn: sqlite3.Connection) -> None:
+    """blobs: neue Art 'pdf', Spalten für Dateiname, OCR-Text und OCR-Status.
+
+    SQLite kann einen CHECK nicht ändern, daher wird die Tabelle neu aufgebaut. Vorhandene
+    Bilder werden zur nachträglichen Texterkennung vorgemerkt (ocr_state='pending')."""
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute("""CREATE TABLE blobs_v7 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            note_id INTEGER REFERENCES notes(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('image', 'avatar', 'pdf')),
+            mime TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+            size INTEGER NOT NULL, key_id TEXT NOT NULL, data BLOB NOT NULL, created_at INTEGER NOT NULL,
+            name TEXT, ocr_text TEXT, ocr_state TEXT NOT NULL DEFAULT 'none',
+            pages INTEGER NOT NULL DEFAULT 0)""")
+        conn.execute("INSERT INTO blobs_v7(id, owner_id, note_id, kind, mime, width, height, size, key_id, data, "
+                     "created_at, ocr_state) SELECT id, owner_id, note_id, kind, mime, width, height, size, key_id, "
+                     "data, created_at, CASE WHEN kind = 'image' THEN 'pending' ELSE 'none' END FROM blobs")
+        conn.execute("DROP TABLE blobs")
+        conn.execute("ALTER TABLE blobs_v7 RENAME TO blobs")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_blobs_note ON blobs(note_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_blobs_ocr ON blobs(ocr_state, id)")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '7')")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+    print("Migration auf Schema v7 abgeschlossen (PDF-Anhänge, OCR).")
+
+
 def key_ids_in_db(conn: sqlite3.Connection) -> dict[str, int]:
     """Zählt, wie viele verschlüsselte Datensätze mit welcher Schlüssel-ID existieren."""
     counts: dict[str, int] = {}
@@ -456,7 +503,7 @@ def key_ids_in_db(conn: sqlite3.Connection) -> dict[str, int]:
         if table not in tables:
             continue
         for kid, n in conn.execute(f"SELECT substr({col}, 1, instr({col}, ':') - 1) AS kid, COUNT(*) "
-                                   f"FROM {table} GROUP BY kid"):
+                                   f"FROM {table} WHERE {col} IS NOT NULL GROUP BY kid"):
             counts[kid] = counts.get(kid, 0) + n
     if "blobs" in tables:
         for kid, n in conn.execute("SELECT key_id, COUNT(*) FROM blobs GROUP BY key_id"):
@@ -609,7 +656,7 @@ def reencrypt_all(conn: sqlite3.Connection, ring: KeyRing, new_kid: str) -> int:
     """Verschlüsselt alle Datensätze mit dem aktiven Schlüssel neu (für Rotation)."""
     changed = 0
     for table, col in ENCRYPTED_COLUMNS:
-        for rid, value in conn.execute(f"SELECT rowid, {col} FROM {table}").fetchall():
+        for rid, value in conn.execute(f"SELECT rowid, {col} FROM {table} WHERE {col} IS NOT NULL").fetchall():
             if not value.startswith(new_kid + ":"):
                 conn.execute(f"UPDATE {table} SET {col} = ? WHERE rowid = ?",
                              (ring.encrypt(ring.decrypt(value)), rid))

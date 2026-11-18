@@ -6,3 +6,5 @@ cryptography>=42.0
 argon2-cffi>=23.1
 Pillow>=10.0
 qrcode>=7.4
+pypdf>=4.0
+pypdfium2>=4.30
