@@ -30,7 +30,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.weight
+
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -93,7 +93,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.hapticfeedback.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -106,6 +106,7 @@ import de.cracky.notizen.model.NoteItem
 import de.cracky.notizen.model.makeItem
 import kotlinx.coroutines.launch
 
+private val HapticFeedbackType.Companion.KeyboardTap: HapticFeedbackType get() = HapticFeedbackType.TextHandleMove
 @Composable
 fun NotizenApp(vm: NotesViewModel = viewModel()) {
     val state by vm.state.collectAsState()
@@ -458,6 +459,7 @@ private fun NoteCard(note: NoteData, onOpen: () -> Unit, onMore: () -> Unit) {
 }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 private fun EditorScreen(
     note: NoteData?, creatingList: Boolean, busy: Boolean, error: String?, readOnly: Boolean,
     onBack: () -> Unit, onSave: (String, String, Boolean, List<NoteItem>) -> Unit
