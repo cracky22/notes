@@ -46,8 +46,27 @@ def doc_text(doc: dict) -> str:
     return "\n".join([str(doc.get("title") or ""), body, items])
 
 
-def doc_tokens(doc: dict) -> list[str]:
-    return sorted(dict.fromkeys(tokens_of_text(doc_text(doc))))[:MAX_TOKENS]
+def doc_tokens(doc: dict, extra_text: str = "") -> list[str]:
+    """Begriffe der Notiz; extra_text (OCR-Text und Dateinamen der Anhänge) füllt nur den Restplatz auf."""
+    base = list(dict.fromkeys(tokens_of_text(doc_text(doc))))[:MAX_TOKENS]
+    if extra_text:
+        seen = set(base)
+        room = MAX_TOKENS - len(base)
+        extra = [t for t in dict.fromkeys(tokens_of_text(extra_text)) if t not in seen]
+        base += extra[:max(0, room)]
+    return sorted(base)
+
+
+def attachment_text(conn, keyring, note_id: int) -> str:
+    """Entschlüsselter OCR-Text (Bilder, PDFs) und PDF-Dateinamen einer Notiz für den Index."""
+    parts = []
+    for r in conn.execute("SELECT kind, name, ocr_text FROM blobs WHERE note_id=? AND kind IN ('image','pdf') "
+                          "AND (ocr_text IS NOT NULL OR name IS NOT NULL) ORDER BY id", (note_id,)):
+        if r["name"]:
+            parts.append(keyring.decrypt(r["name"]))
+        if r["ocr_text"]:
+            parts.append(core.decompress_payload_text(keyring.decrypt(r["ocr_text"])))
+    return "\n".join(parts)
 
 
 def query_words(q: str) -> list[str]:
@@ -210,7 +229,7 @@ def _index_note(conn, keyring, note_id: int, only_user: int | None = None) -> in
     members = [r for r in members if r[2]]
     if not members:
         return 0
-    tokens = doc_tokens(_load_note_doc(keyring, note["payload"]))
+    tokens = doc_tokens(_load_note_doc(keyring, note["payload"]), attachment_text(conn, keyring, note_id))
     entry = _entry_payload(keyring, tokens)
     for uid, gen, enc_key in members:
         user_key = _decode_user_key(keyring, enc_key)

@@ -12,6 +12,7 @@ notizen/
 ├── app.py            Webserver (FastAPI + WebSocket, direkt startbar)
 ├── admin.py          Verwaltungsprogramm (Benutzer, Schlüssel, Backups)
 ├── core.py           Datenbank, Migration, Verschlüsselung, Passwörter, Bildverarbeitung
+├── ocr.py            Texterkennung (Tesseract) für Bilder und PDF-Anhänge
 ├── search_index.py   Getrennte, verschlüsselte Suchindizes je Benutzer
 ├── ot.py             Operational Transformation (konfliktfreie Zusammenarbeit)
 ├── requirements.txt
@@ -32,7 +33,14 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Pakete: `fastapi`, `uvicorn`, `websockets` (Echtzeit), `pydantic`, `cryptography`, `argon2-cffi`, `Pillow` (Bilder).
+Pakete: `fastapi`, `uvicorn`, `websockets` (Echtzeit), `pydantic`, `cryptography`, `argon2-cffi`, `Pillow` (Bilder),
+`pypdf` und `pypdfium2` (PDF-Anhänge).
+
+**OCR (Systempaket, optional aber empfohlen):** `tesseract` mit Sprachdaten, z. B.
+`sudo apt install tesseract-ocr tesseract-ocr-deu tesseract-ocr-eng`. Ohne Tesseract funktionieren Notizen wie bisher;
+neue Bilder/PDFs bleiben „ausstehend“ und werden automatisch verarbeitet, sobald Tesseract gefunden wird (Prüfung alle 60 s).
+Einstellungen per Umgebungsvariable: `NOTIZEN_OCR_LANGS` (Standard `deu+eng`), `NOTIZEN_TESSERACT` (Pfad),
+`NOTIZEN_OCR_DPI` (Standard 300), `NOTIZEN_OCR_THREADS` (Standard 2).
 
 ## Einrichten und starten
 
@@ -57,6 +65,7 @@ Schema migriert; vor einer Migration wird unter `data/backups/` eine Sicherung a
 | Teilen & Zusammenarbeit | Symbol „Mitbearbeiter“ (Person mit +) auf Karte/Notiz → Benutzer suchen → Speichern. Alle Teilnehmer sehen Änderungen sofort, mit Live-Cursor (Profilbild + Name) und farbigem Ring für „bearbeitet gerade“. Anheften, Archiv, Labels und Reihenfolge bleiben wie im Original pro Person. |
 | Formatierung | Symbol „A“ in der Notiz: Überschrift 1/2, normaler Text, fett, kursiv, unterstrichen, Formatierung entfernen |
 | Bilder | Bildsymbol, Einfügen aus der Zwischenablage oder Drag & Drop; Klick öffnet die Großansicht |
+| PDF-Anhänge & OCR | Das Bildsymbol (oder Drag & Drop) nimmt auch PDF-Dateien an (max. 40 MB, 150 Seiten, 20 je Notiz; keine passwortgeschützten). Direkt nach dem Hochladen läuft im Hintergrund die Texterkennung: Seiten ohne Text (Scans) werden erkannt und mit unsichtbarer Textebene neu zusammengesetzt, Seiten mit vorhandenem Text bleiben unverändert. Die bearbeitete Datei **ersetzt** das hochgeladene Original. Der erkannte Text und der Dateiname gehen in den Suchindex ein. Auch in Bildern (z. B. Screenshots) wird Text erkannt – nur für die Suche, das Bild bleibt unverändert. Status je PDF: „Texterkennung läuft“ → „durchsuchbar“. Suchfilter „PDFs“ unter Typen. |
 | Mehrfachauswahl | Häkchen oben links auf der Karte (beim Überfahren), Umschalt+Klick wählt Bereiche |
 | Suche | Klick ins Suchfeld zeigt Typen (Listen, Bilder, Links, Geteilt), Labels, Dinge (Bücher, Essen, Reisen …) und Farben |
 | Suchindex | Volltextsuche läuft über einen invertierten Index mit eigenem Bereich je Benutzer. Notizwortlisten und nutzerspezifische HMAC-Schlüssel sind AES-verschlüsselt; die Terme selbst werden nur als HMAC-Prüfsummen gespeichert. Der Server baut den Index beim Start im Hintergrund auf und hält Änderungen laufend nach. Im Kontomenü kann der eigene Index neu aufgebaut werden (höchstens alle 10 Minuten); Admins können den Index je Benutzer im Adminpanel zurücksetzen. Ein Reset löscht den bisherigen Index und startet den Neuaufbau. |
@@ -80,7 +89,7 @@ Verbindungsabbrüche werden abgefangen: Änderungen bleiben im Browser vorgemerk
 der Wiederverbindung nachgereicht. `python tests/test_ot.py` prüft die Konvergenz mit 5000
 Zufallsfällen.
 Die Kompressions-/Migrationstests laufen mit `python tests/test_compression.py`, der Suchindex mit
-`python tests/test_search_index.py`.
+`python tests/test_search_index.py`, PDF/OCR (benötigt Tesseract) mit `python tests/test_ocr.py`.
 
 ## Verwaltungsprogramm
 
@@ -140,3 +149,11 @@ Hinweis: Das ist Verschlüsselung „at rest“ – wer Datenbank **und** Schlü
 `NOTIZEN_DATA_DIR`, `NOTIZEN_DB`, `NOTIZEN_KEY_FILE`, `NOTIZEN_BACKUP_DIR`,
 `NOTIZEN_SESSION_DAYS` (Standard 30), `NOTIZEN_HOST`, `NOTIZEN_PORT`,
 `NOTIZEN_SECURE_COOKIE=1` (Secure-Cookie erzwingen), `NOTIZEN_PUBLIC_URL` (öffentliche URL inkl. Proxy-Prefix für QR- und Anmeldelinks).
+
+## Hinweise zu PDF-Anhängen und OCR
+
+- Erkannter Text (`blobs.ocr_text`) und Dateinamen liegen wie Notizinhalte AES-verschlüsselt in der Datenbank, der Schlüsselwechsel (`key rotate`) schließt sie ein. In den Suchindex gelangen nur HMAC-Prüfsummen.
+- Beim Update auf Schema v7 wird die Tabelle `blobs` neu aufgebaut (mit automatischer Sicherung). Bereits vorhandene Bilder werden danach schrittweise im Hintergrund per OCR indexiert.
+- Die Warteschlange liegt in der Datenbank (`ocr_state`), ein Neustart unterbricht nichts. Es läuft immer nur ein OCR-Auftrag gleichzeitig.
+- Wird das Speicherkontingent durch die größere OCR-Datei überschritten, bleibt das Original erhalten; der erkannte Text ist trotzdem durchsuchbar.
+- Gedruckter Text wird gut erkannt, Handschrift und Fotos ohne Text nicht. Wörter mit geringer Erkennungssicherheit werden bewusst nicht indexiert.

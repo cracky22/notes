@@ -805,3 +805,20 @@ body.selecting .card-toolbar { opacity: 0 !important; pointer-events: none; }
 .account-index .index-label .text-btn { padding:4px 8px; font-size:12px; }
 .account-index .index-detail { margin-top:2px; }
 .account-index .usage-track { margin-top:7px; }
+
+/* PDF-Anhänge (Karte und Editor) */
+.pdf-list { display: flex; flex-direction: column; gap: 6px; padding: 8px 12px 0; }
+.card-pdfs { padding: 8px 10px 2px; }
+.ed-pdfs { padding: 8px 16px 0; }
+.pdf-item { position: relative; display: flex; align-items: center; min-width: 0; border-radius: 8px; background: var(--chip-bg); }
+.pdf-open { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; padding: 8px 10px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; border-radius: 8px; }
+.pdf-open:hover { background: var(--hover-soft); }
+.pdf-open > svg { flex: none; color: #d93025; }
+.pdf-text { display: flex; flex-direction: column; min-width: 0; }
+.pdf-name { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pdf-meta { font-size: 11px; opacity: .7; }
+.pdf-item.busy .pdf-meta { animation: pdf-pulse 1.4s ease-in-out infinite; }
+.pdf-item.failed .pdf-meta { color: #d93025; opacity: 1; }
+.pdf-del { flex: none; margin-right: 2px; }
+@keyframes pdf-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .pdf-item.busy .pdf-meta { animation: none; } }

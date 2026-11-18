@@ -35,6 +35,7 @@ export const ICONS = {
   light_mode: 'M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58a.996.996 0 0 0-1.41 0 .996.996 0 0 0 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0s.39-1.03 0-1.41L5.99 4.58zm12.37 12.37a.996.996 0 0 0-1.41 0 .996.996 0 0 0 0 1.41l1.06 1.06c.39.39 1.03.39 1.41 0a.996.996 0 0 0 0-1.41l-1.06-1.06zm1.06-10.96a.996.996 0 0 0 0-1.41.996.996 0 0 0-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41s1.03.39 1.41 0l1.06-1.06zM7.05 18.36a.996.996 0 0 0 0-1.41.996.996 0 0 0-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41s1.03.39 1.41 0l1.06-1.06z',
   brightness_auto: 'M10.85 12.65h2.3L12 9l-1.15 3.65zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12 20 8.69zM14.3 16l-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9h-1.9z',
   person_add_o: 'M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0-6c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2zm0 8c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4zm-6 4c.22-.72 3.31-2 6-2 2.7 0 5.8 1.29 6 2H9zm-3-3v-3h3v-2H6V7H4v3H1v2h3v3z',
+  picture_as_pdf: 'M20 2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8.5 7.5c0 .83-.67 1.5-1.5 1.5H9v2H7.5V7H10c.83 0 1.5.67 1.5 1.5v1zm5 2c0 .83-.67 1.5-1.5 1.5h-2.5V7H15c.83 0 1.5.67 1.5 1.5v3zm4-3H19v1h1.5V11H19v2h-1.5V7h3v1.5zM9 9.5h1v-1H9v1zM4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm10 5.5h1v-3h-1v3z',
   image_o: 'M19 5v14H5V5h14m0-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-4.86 8.86-3 3.87L9 13.14 6 17h12l-3.86-5.14z',
   undo: 'M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z',
   redo: 'M18.4 10.6C16.55 8.99 14.15 8 11.5 8c-4.65 0-8.58 3.03-9.96 7.22L3.9 16c1.05-3.19 4.05-5.5 7.6-5.5 1.95 0 3.73.72 5.12 1.88L13 16h9V7l-3.6 3.6z',
@@ -105,6 +106,34 @@ export function iconBtn(name, title, onclick, cls = '', size = 24) {
 }
 
 export function setIcon(el, name, size = 24) { el.replaceChildren(icon(name, size)); }
+
+export const isPdfFile = f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name || '');
+export const isAttachable = f => f.type.startsWith('image/') || isPdfFile(f);
+
+function fmtSize(bytes) {
+  if (!bytes) return '';
+  return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1).replace('.', ',')} MB`;
+}
+
+/** Liste der PDF-Anhänge einer Notiz (Karte: nur Öffnen, Editor: zusätzlich Entfernen). */
+export function pdfList(pdfs, { cls = '', onRemove = null } = {}) {
+  const wrap = h('div', { class: `pdf-list ${cls}`.trim() });
+  for (const p of pdfs) {
+    const status = p.uploading ? 'Wird hochgeladen …'
+      : p.ocr === 'pending' ? 'Texterkennung läuft …'
+        : p.ocr === 'failed' ? 'Texterkennung fehlgeschlagen'
+          : p.ocr === 'done' ? 'durchsuchbar' : '';
+    const meta = [p.pages ? `${p.pages} ${p.pages === 1 ? 'Seite' : 'Seiten'}` : '', fmtSize(p.size), status].filter(Boolean).join(' · ');
+    const open = () => { if (!p.uploading && p.id) window.open(`api/pdfs/${p.id}`, '_blank', 'noopener'); };
+    const row = h('div', { class: 'pdf-item' + (p.uploading || p.ocr === 'pending' ? ' busy' : '') + (p.ocr === 'failed' ? ' failed' : '') },
+      h('button', { type: 'button', class: 'pdf-open', title: `${p.name} öffnen`, onclick: e => { e.stopPropagation(); open(); } },
+        icon('picture_as_pdf', 22),
+        h('span', { class: 'pdf-text' }, h('span', { class: 'pdf-name', text: p.name }), h('span', { class: 'pdf-meta', text: meta }))));
+    if (onRemove && !p.uploading) row.append(iconBtn('delete', 'PDF entfernen', e => { e.stopPropagation(); onRemove(p); }, 'pdf-del', 20));
+    wrap.append(row);
+  }
+  return wrap;
+}
 
 export function debounce(fn, ms) {
   let t;
@@ -355,8 +384,8 @@ export function confirmDialog(text, okLabel = 'OK', title = null) {
   });
 }
 
-/** Lässt den Nutzer Bilddateien auswählen. */
-export function pickFiles({ accept = 'image/*', multiple = true } = {}) {
+/** Lässt den Nutzer Bild- oder PDF-Dateien auswählen. */
+export function pickFiles({ accept = 'image/*,application/pdf,.pdf', multiple = true } = {}) {
   return new Promise(resolve => {
     const input = h('input', { type: 'file', accept, multiple, style: { display: 'none' } });
     input.addEventListener('change', () => { resolve([...input.files]); input.remove(); });

@@ -2,7 +2,7 @@
 import { Delta, invertChange, composeChanges, xform, transformIndex, sortItems } from './delta.js';
 import { TextField } from './editor.js';
 import { rid } from './sync.js';
-import { h, icon, iconBtn, setIcon, avatar, userColor, openPopover, closePopover, menu, captureLayout, playLayout, throttle, fmtDate, fmtDateLong, plural } from './dom.js';
+import { h, icon, iconBtn, pdfList, isAttachable, setIcon, avatar, userColor, openPopover, closePopover, menu, captureLayout, playLayout, throttle, fmtDate, fmtDateLong, plural } from './dom.js';
 import { state, app, setting, hintFor } from './state.js';
 
 // Positionen erhalten einen kleinen Zufallsversatz, damit gleichzeitig angelegte Elemente
@@ -70,6 +70,7 @@ export class NoteEditor {
   build() {
     this.root = h('div', { class: `editor is-${this.mode}` });
     this.imagesEl = h('div', { class: 'ed-images' });
+    this.pdfsEl = h('div', { class: 'ed-pdfs' });
     this.title = new TextField({
       placeholder: 'Titel', className: 'ed-title', label: 'Titel', readOnly: this.readOnly,
       onChange: (d, info) => this.onFieldChange('title', d, info),
@@ -109,6 +110,7 @@ export class NoteEditor {
     this.cursorLayer = h('div', { class: 'rc-layer', 'aria-hidden': 'true' });
     this.scroll = h('div', { class: 'editor-scroll' },
       this.imagesEl,
+      this.pdfsEl,
       h('div', { class: 'ed-head' }, this.title.el, this.readOnly ? null : this.pinBtn),
       this.bodyWrap, this.chipsEl, this.metaEl, this.cursorLayer);
     this.formatBar = h('div', { class: 'ed-formatbar', role: 'toolbar', 'aria-label': 'Formatierung' });
@@ -118,7 +120,7 @@ export class NoteEditor {
     this.root.addEventListener('dragleave', e => { if (!this.root.contains(e.relatedTarget)) this.root.classList.remove('drop'); });
     this.root.addEventListener('drop', e => {
       this.root.classList.remove('drop');
-      const files = [...(e.dataTransfer.files || [])].filter(f => f.type.startsWith('image/'));
+      const files = [...(e.dataTransfer.files || [])].filter(isAttachable);
       if (files.length && !this.readOnly) { e.preventDefault(); this.addImages(files); }
     });
     this.loadFields();
@@ -731,6 +733,7 @@ export class NoteEditor {
       this.pinBtn.classList.toggle('on', !!m.pinned);
     }
     this.renderImages();
+    this.renderPdfs();
     this.chipsEl.replaceChildren();
     const chips = app.labelChips(m.labels || [], this.readOnly ? null : id => this.actions.setLabels(m.labels.filter(x => x !== id)), false);
     const members = (m.members || []).filter(u => u.id !== state.user.id);
@@ -788,6 +791,14 @@ export class NoteEditor {
       if (img.uploading) tile.append(h('div', { class: 'spinner' }));
       this.imagesEl.append(tile);
     });
+  }
+
+  renderPdfs() {
+    const pdfs = this.meta.pdfs || [];
+    this.pdfsEl.replaceChildren();
+    this.pdfsEl.classList.toggle('hidden', !pdfs.length);
+    if (!pdfs.length) return;
+    this.pdfsEl.append(pdfList(pdfs, { onRemove: this.readOnly || !this.actions.removePdf ? null : p => this.actions.removePdf(p) }));
   }
 
   addImages(files) {

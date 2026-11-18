@@ -6,13 +6,13 @@ import { clearLocalAppCache, reconcileCacheGeneration } from './offline.js';
 import * as D from './dialogs.js';
 import {
   $, h, icon, iconBtn, setIcon, avatar, openModal, modals, openPopover, closePopover, popoverOwner, menu, toast, hideToast, setSnackbarsEnabled,
-  confirmDialog, captureLayout, playLayout, debounce, plural, pickFiles, shrinkImage, animate,
+  confirmDialog, captureLayout, playLayout, debounce, plural, pickFiles, shrinkImage, animate, pdfList, isPdfFile, isAttachable,
 } from './dom.js';
 import {
   state, app, store, api, AuthError, setting, updateSettings, keymap, comboFromEvent, SHORTCUT_SCOPE, hintFor,
 } from './state.js';
 
-const META_KEYS = ['color', 'images', 'members', 'owner_id', 'role', 'pinned', 'archived', 'position', 'trashed',
+const META_KEYS = ['color', 'images', 'pdfs', 'members', 'owner_id', 'role', 'pinned', 'archived', 'position', 'trashed',
   'trashed_at', 'labels', 'created_at', 'updated_at', 'updated_by', 'compressed'];
 const THEMES = { system: ['brightness_auto', 'Design: wie System'], light: ['light_mode', 'Design: hell'], dark: ['dark_mode', 'Design: dunkel'] };
 const URL_RE = /\bhttps?:\/\/\S+/i;
@@ -60,6 +60,7 @@ let cacheResetPoll = null;
 const TYPES = [
   ['list', 'Listen', 'check_box', n => n.ns.doc.is_list],
   ['image', 'Bilder', 'image_o', n => n.images.length > 0],
+  ['pdf', 'PDFs', 'picture_as_pdf', n => (n.pdfs || []).length > 0],
   ['url', 'Links', 'link', n => URL_RE.test(noteText(n))],
   ['shared', 'Geteilt', 'group', n => n.members.length > 1],
 ];
@@ -156,7 +157,9 @@ function upsertNote(view) {
     n.ns.on(ev => { if (ev.type !== 'synced') noteChanged(n.id); if (ev.type === 'reset' && ev.lost) toast('Einige Änderungen konnten nicht synchronisiert werden.'); });
     state.notes.set(n.id, n);
   } else {
+    const pdfsBefore = JSON.stringify(n.pdfs || []);
     Object.assign(n, metaOf(view));
+    if (view.pdfs && JSON.stringify(view.pdfs) !== pdfsBefore) noteChanged(n.id);   // z. B. Texterkennung fertig
     if (deferred) {
       // List responses carry metadata only for archived notes. Keep any already-loaded body cached.
       if (!n.contentLoaded || view.rev > n.ns.rev) {
@@ -322,6 +325,7 @@ async function actEmptyTrash() {
 }
 
 async function uploadImages(n, files) {
+  for (const file of files.filter(isPdfFile)) await uploadPdf(n, file);
   for (const file of files.filter(f => f.type.startsWith('image/'))) {
     const ph = { uploading: true, url: URL.createObjectURL(file), w: 4, h: 3 };
     n.images = [...n.images, ph];
@@ -339,6 +343,31 @@ async function uploadImages(n, files) {
     if (editor && editor.note === n) editor.ed.refreshMeta();
     noteChanged(n.id);
   }
+}
+
+async function uploadPdf(n, file) {
+  const ph = { uploading: true, name: file.name || 'Dokument.pdf', size: file.size, pages: 0, ocr: '' };
+  n.pdfs = [...(n.pdfs || []), ph];
+  if (editor && editor.note === n) editor.ed.refreshMeta();
+  noteChanged(n.id);
+  try {
+    const pdf = await api('POST', `/api/notes/${n.id}/pdfs?name=${encodeURIComponent(ph.name)}`, file, { raw: true, contentType: 'application/pdf' });
+    // Die Texterkennung läuft danach auf dem Server; das Ergebnis kommt per Echtzeit-Update (Status „durchsuchbar“).
+    n.pdfs = n.pdfs.map(x => (x === ph ? pdf : x));
+  } catch (e) {
+    n.pdfs = n.pdfs.filter(x => x !== ph);
+    handleError(e);
+  }
+  if (editor && editor.note === n) editor.ed.refreshMeta();
+  noteChanged(n.id);
+}
+
+async function removePdf(n, pdf) {
+  if (!await confirmDialog('PDF aus der Notiz entfernen?', 'Entfernen')) return;
+  n.pdfs = (n.pdfs || []).filter(x => x.id !== pdf.id);
+  if (editor && editor.note === n) editor.ed.refreshMeta();
+  noteChanged(n.id);
+  try { await api('DELETE', `/api/notes/${n.id}/pdfs/${pdf.id}`); } catch (e) { handleError(e); reloadAll(); }
 }
 
 async function removeImage(n, img) {
@@ -743,6 +772,7 @@ function buildCard(n, list) {
     card.append(h('div', { class: 'deferred-note', role: 'status', text: n._deferredPromise ? 'Archivnotiz wird geladen …' : 'Archivnotiz wird bei Bedarf vom Server geladen' }));
   } else {
     if (n.images.length) card.append(imageGrid(n.images, 'card-images'));
+    if ((n.pdfs || []).length) card.append(pdfList(n.pdfs, { cls: 'card-pdfs' }));
     const hasTitle = doc.title.trim() !== '';
     if (hasTitle) card.append(h('div', { class: 'note-title', text: doc.title }));
     if (doc.is_list && doc.items.length) {
@@ -750,12 +780,12 @@ function buildCard(n, list) {
     } else if (!doc.is_list && doc.body.length() > 1) {
       const body = h('div', { class: 'note-body' });
       const text = doc.body.text();
-      const big = !hasTitle && !n.images.length && text.length <= 60 && text.split('\n').length <= 3 && !doc.body.ops.some(o => o.attributes);
+      const big = !hasTitle && !n.images.length && !(n.pdfs || []).length && text.length <= 60 && text.split('\n').length <= 3 && !doc.body.ops.some(o => o.attributes);
       if (big) body.classList.add('big');
       body.innerHTML = renderHTML(doc.body, { rich: true, links: true, maxChars: 1500 });
       for (const a of body.querySelectorAll('a')) a.addEventListener('click', e => e.stopPropagation());
       card.append(body);
-    } else if (!hasTitle && !n.images.length) {
+    } else if (!hasTitle && !n.images.length && !(n.pdfs || []).length) {
       card.append(h('div', { class: 'note-body empty-note', text: 'Leere Notiz' }));
     }
     const preview = linkPreview(n);
@@ -823,7 +853,7 @@ function cardToolbar(n) {
   bar.append(
     iconBtn('person_add_o', 'Mitbearbeiter', stop(() => D.openShareDialog(n)), '', 18),
     pal,
-    iconBtn('image_o', 'Bild hinzufügen', stop(async () => { const f = await pickFiles(); if (f.length) uploadImages(n, f); }), '', 18),
+    iconBtn('image_o', 'Bild oder PDF hinzufügen', stop(async () => { const f = await pickFiles(); if (f.length) uploadImages(n, f); }), '', 18),
     iconBtn(n.archived ? 'unarchive' : 'archive', n.archived ? 'Archivierung aufheben' : 'Archivieren', stop(() => actArchive([n])), '', 18),
     more);
   return bar;
@@ -919,7 +949,7 @@ function renderComposer() {
   wrap.replaceChildren(h('div', { class: 'composer collapsed' },
     h('button', { type: 'button', class: 'composer-placeholder', onclick: () => expandComposer() }, 'Notiz schreiben…'),
     iconBtn('check_box', `Neue Liste (${hintFor('newList')})`, () => expandComposer({ list: true })),
-    iconBtn('image_o', 'Neue Notiz mit Bild', async () => { const f = await pickFiles(); if (f.length) expandComposer({ files: f }); })));
+    iconBtn('image_o', 'Neue Notiz mit Bild oder PDF', async () => { const f = await pickFiles(); if (f.length) expandComposer({ files: f }); })));
 }
 
 function expandComposer({ list = false, files = null, draft = null } = {}) {
@@ -928,7 +958,7 @@ function expandComposer({ list = false, files = null, draft = null } = {}) {
   const ns = draft ? draft.ns : new NoteState(null, null);
   if (!draft && list) ns.doc.is_list = true;
   const meta = draft ? draft.meta : {
-    color: 'default', pinned: false, archived: false, collaborators: [], images: [],
+    color: 'default', pinned: false, archived: false, collaborators: [], images: [], pdfs: [],
     labels: state.view === 'label' && state.labelId ? [state.labelId] : [],
   };
   composer.ns = ns;
@@ -936,6 +966,7 @@ function expandComposer({ list = false, files = null, draft = null } = {}) {
   composer.expanded = true;
   const refresh = () => composer.ed && composer.ed.refreshMeta();
   const addFiles = fs => {
+    for (const file of fs.filter(isPdfFile)) meta.pdfs.push({ file, name: file.name || 'Dokument.pdf', size: file.size, pages: 0, ocr: '' });
     for (const file of fs.filter(f => f.type.startsWith('image/'))) {
       const img = { file, url: URL.createObjectURL(file), w: 4, h: 3 };
       meta.images.push(img);
@@ -957,6 +988,7 @@ function expandComposer({ list = false, files = null, draft = null } = {}) {
       pickImages: async () => addFiles(await pickFiles()),
       addImages: addFiles,
       removeImage: img => { meta.images = meta.images.filter(x => x !== img); URL.revokeObjectURL(img.url); refresh(); },
+      removePdf: p => { meta.pdfs = meta.pdfs.filter(x => x !== p); refresh(); },
       viewImage: i => D.openLightbox(meta.images, i),
       close: () => closeComposer(),
     },
@@ -988,7 +1020,7 @@ async function closeComposer() {
   renderComposer();
   const d = ns.doc;
   const items = d.items.filter(i => i.text.trim());
-  const empty = !d.title.trim() && (d.is_list ? !items.length : !d.body.text().trim()) && !meta.images.length;
+  const empty = !d.title.trim() && (d.is_list ? !items.length : !d.body.text().trim()) && !meta.images.length && !meta.pdfs.length;
   if (empty) { composerSaving = false; return; }
   try {
     const view = await api('POST', '/api/notes', {
@@ -997,7 +1029,7 @@ async function closeComposer() {
     });
     const n = upsertNote(view);
     if (meta.archived) toast('Notiz archiviert', 'Rückgängig', () => patchNote(n, { archived: false }));
-    if (meta.images.length) await uploadImages(n, meta.images.map(i => i.file));
+    if (meta.images.length || meta.pdfs.length) await uploadImages(n, [...meta.pdfs.map(p => p.file), ...meta.images.map(i => i.file)]);
     for (const img of meta.images) URL.revokeObjectURL(img.url);
   } catch (e) {
     handleError(e);
@@ -1030,6 +1062,7 @@ function openEditor(n, cardEl = null) {
     pickImages: async () => { const f = await pickFiles(); if (f.length) uploadImages(n, f); },
     addImages: files => uploadImages(n, files),
     removeImage: img => removeImage(n, img),
+    removePdf: p => removePdf(n, p),
     viewImage: i => D.openLightbox(n.images, i, { onDelete: n.trashed ? null : img => removeImage(n, img) }),
     versions: () => D.openVersions(n),
     close: () => closeEditor(),
