@@ -864,7 +864,7 @@ async function pollSearchIndex(box) {
     const st = await api('GET', '/api/me/search-index');
     if (!box.isConnected) return;
     drawSearchIndex(box, st);
-    if (st.state === 'pending' || st.state === 'building') setTimeout(() => pollSearchIndex(box), 2000);
+    if (st.state === 'pending' || st.state === 'building' || (st.ocr_pending && st.ocr_available !== false)) setTimeout(() => pollSearchIndex(box), 2000);
   } catch { box.textContent = 'Suchindex-Status nicht verfügbar'; }
 }
 
@@ -875,15 +875,16 @@ function drawSearchIndex(box, st) {
   const detail = st.state === 'building' ? `${st.done} / ${st.total} Notizen indiziert`
     : st.state === 'ready' ? [`${st.entries} Notizen`, formatBytes(st.bytes), when && `erstellt ${when}`].filter(Boolean).join(' · ')
     : st.state === 'error' ? (st.error || 'Unbekannter Fehler') : 'Neuaufbau startet in Kürze';
+  const ocrLine = st.ocr_pending ? (st.ocr_available === false ? `${st.ocr_pending} Anhänge warten auf Texterkennung (auf dem Server nicht verfügbar)` : `Texterkennung läuft noch für ${st.ocr_pending} Anhänge …`) : null;
   const btn = h('button', {
     type: 'button', class: 'text-btn', text: 'Neu indizieren', disabled: busy || cooling,
-    title: cooling ? `Wieder möglich in ${Math.ceil(st.cooldown / 60)} Min.` : 'Suchindex verwerfen und neu aufbauen',
+    title: cooling ? `Wieder möglich in ${Math.ceil(st.cooldown / 60)} Min.` : 'Suchindex neu aufbauen und Texterkennung für Bilder und PDFs erneut durchführen',
     onclick: async e => {
       e.stopPropagation();
       btn.disabled = true;
       try {
         drawSearchIndex(box, await api('POST', '/api/me/search-index/rebuild'));
-        toast('Suchindex wird neu aufgebaut');
+        toast('Suchindex und Texterkennung werden neu gestartet');
         setTimeout(() => pollSearchIndex(box), 1500);
       } catch (err) { toast(err.message); btn.disabled = false; }
     },
@@ -892,6 +893,7 @@ function drawSearchIndex(box, st) {
   box.replaceChildren(
     h('div', { class: 'index-label' }, h('strong', { text: INDEX_STATES[st.state] || st.state }), btn),
     h('div', { class: 'index-detail', text: detail }),
+    ocrLine ? h('div', { class: 'index-detail', text: ocrLine }) : null,
     st.state === 'building' ? h('div', { class: 'usage-track' }, h('span', { style: { width: `${pct}%` } })) : null);
 }
 

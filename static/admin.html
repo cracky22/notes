@@ -14,6 +14,10 @@
   <header class="admin-top"><a class="admin-brand" href="/">← Notizen</a><span>Administration</span><button id="refresh" class="text-btn">Aktualisieren</button></header>
   <main class="admin-main">
     <section class="admin-intro"><div><p class="eyebrow">VERWALTUNG</p><h1>Nutzung & Kontingente</h1><p>Speicherverbrauch pro Benutzer, aktive Sitzungen und Limits.</p></div><div class="admin-total" id="totals">Lade Daten …</div></section>
+    <section class="admin-create-panel" aria-labelledby="ocr-title">
+      <div class="admin-create-heading"><div><h2 id="ocr-title">Texterkennung (OCR)</h2><p id="ocr-status">Lade Status …</p></div>
+        <button id="ocr-rerun" class="text-btn primary" type="button">OCR für alle Nutzer neu durchführen</button></div>
+    </section>
     <section class="admin-create-panel" aria-labelledby="create-user-title">
       <div class="admin-create-heading"><div><h2 id="create-user-title">Nutzer anlegen</h2><p>Lege ein normales Nutzerkonto an. Das Passwort wird nur als sicherer Hash gespeichert und nicht erneut angezeigt.</p></div></div>
       <form id="create-user-form" class="admin-create-form">
