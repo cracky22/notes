@@ -209,6 +209,27 @@ def test_all():
         assert [l["name"] for l in c.get("/api/labels").json()] == ["Ben privat"]
         _login(c, "anna")
         assert c.get("/api/labels").json() == []
+        # ---- OCR neu anstoßen (Nutzer-Neuindizierung und Admin) ------------------
+        import app as appmod
+        import time
+        def settle():
+            end = time.time() + 60
+            while time.time() < end and appmod.ocr_pending(core.connect()):
+                time.sleep(0.5)
+        settle()
+        r = c.post("/api/me/search-index/rebuild", headers=CSRF)
+        assert r.status_code == 200 and r.json()["ocr_pending"] >= 1             # Anhänge von anna wieder in der Warteschlange
+        settle()
+        assert c.get("/api/me/search-index").json()["ocr_pending"] == 0
+        assert c.post("/api/admin/ocr/rerun", headers=CSRF).status_code == 403    # kein Admin
+        db = core.connect(); db.execute("UPDATE users SET is_admin=1 WHERE username='anna'"); db.commit(); db.close()
+        _login(c, "anna")
+        s = c.get("/api/admin/ocr").json()
+        assert s["total"] >= 3 and s["available"] is True
+        q = c.post("/api/admin/ocr/rerun", headers=CSRF).json()
+        assert q["queued"] >= 3
+        settle()
+        assert c.get("/api/admin/ocr").json()["pending"] == 0
         # Verlässt der Inhaber die gemeinsame Notiz nicht, bleibt alles konsistent: Rotation kennt die neue Tabelle
         conn = core.connect()
         assert core.key_ids_in_db(conn)

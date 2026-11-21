@@ -203,7 +203,28 @@ $('#create-user-form').addEventListener('submit',async e=>{
   finally { button.disabled=false; }
 });
 $('#password-dialog').addEventListener('close',()=>{ $('#reset-password').value=''; $('#reset-password-confirm').value=''; passwordTarget=null; });
-$('#refresh').addEventListener('click',()=>{load();loadMetrics();});
+let ocrPoll=null;
+async function loadOcr() {
+  clearTimeout(ocrPoll);
+  try {
+    const s=await api('GET','/api/admin/ocr');
+    const done=s.total-s.pending;
+    $('#ocr-status').textContent=!s.available ? 'Tesseract nicht gefunden – Texterkennung ist nicht verfügbar.'
+      : s.pending ? `Läuft: ${done} / ${s.total} Anhänge erkannt, ${s.pending} warten.`
+      : `${s.total} Anhänge (Bilder, PDFs) · ${s.failed} fehlgeschlagen · keine Aufgaben offen.`;
+    $('#ocr-rerun').disabled=!s.available||s.pending>0;
+    if (s.pending) ocrPoll=setTimeout(loadOcr,3000);
+  } catch(e) { $('#ocr-status').textContent=e.message; }
+}
+$('#ocr-rerun').addEventListener('click',async()=>{
+  if (!confirm('Texterkennung für alle Bilder und PDFs aller Nutzer neu durchführen? Das kann je nach Menge lange dauern und belastet den Server.')) return;
+  const b=$('#ocr-rerun'); b.disabled=true;
+  try { const r=await api('POST','/api/admin/ocr/rerun'); toast(`${r.queued} Anhänge vorgemerkt`); }
+  catch(e) { toast(e.message); }
+  loadOcr();
+});
+$('#refresh').addEventListener('click',()=>{load();loadMetrics();loadOcr();});
+loadOcr();
 load();
 loadMetrics();
 setInterval(()=>{if(!document.hidden)loadMetrics();},15000);

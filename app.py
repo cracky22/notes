@@ -251,6 +251,28 @@ def wake_ocr() -> None:
         hub.loop.call_soon_threadsafe(_ocr_wakeup.set)
 
 
+def requeue_ocr(conn, user_id: int | None = None) -> int:
+    """Stellt Anhänge (Bilder, PDFs) erneut in die OCR-Warteschlange; user_id=None: alle Benutzer.
+
+    Bei einem Benutzer zählen alle Anhänge der Notizen, an denen er beteiligt ist. Der bisher erkannte Text
+    bleibt bis zum neuen Ergebnis erhalten (und damit durchsuchbar). Gibt die Zahl neu vorgemerkter Anhänge zurück."""
+    sql = "UPDATE blobs SET ocr_state='pending' WHERE kind IN ('image','pdf') AND ocr_state <> 'pending'"
+    params: tuple = ()
+    if user_id is not None:
+        sql += " AND note_id IN (SELECT note_id FROM note_users WHERE user_id = ?)"
+        params = (user_id,)
+    return conn.execute(sql, params).rowcount
+
+
+def ocr_pending(conn, user_id: int | None = None) -> int:
+    sql = "SELECT COUNT(*) FROM blobs WHERE kind IN ('image','pdf') AND ocr_state='pending'"
+    params: tuple = ()
+    if user_id is not None:
+        sql += " AND note_id IN (SELECT note_id FROM note_users WHERE user_id = ?)"
+        params = (user_id,)
+    return conn.execute(sql, params).fetchone()[0]
+
+
 def _ocr_finish(conn, job, *, text: str | None, new_pdf: bytes | None, pages: int, state: str) -> None:
     """Schreibt das Ergebnis (nur, wenn der Anhang inzwischen nicht gelöscht wurde) und stößt die Indexierung an."""
     conn.execute("BEGIN IMMEDIATE")
@@ -259,7 +281,7 @@ def _ocr_finish(conn, job, *, text: str | None, new_pdf: bytes | None, pages: in
         conn.rollback()
         return
     enc_text = keyring.encrypt(core.compress_payload_text(text, 0.05) or text) if text else None
-    conn.execute("UPDATE blobs SET ocr_text=?, ocr_state=? WHERE id=?", (enc_text, state, job["id"]))
+    conn.execute("UPDATE blobs SET ocr_text=COALESCE(?, ocr_text), ocr_state=? WHERE id=?", (enc_text, state, job["id"]))   # alter Text bleibt, falls der neue Lauf nichts liefert
     if new_pdf is not None:
         grow = len(new_pdf) - job["size"]
         fits = True
@@ -975,6 +997,8 @@ def my_search_index(user=Depends(current_user), conn=Depends(get_db)):
     st = sidx.status(conn, user["id"])
     if st["state"] == "error":
         st["error"] = "Neuaufbau fehlgeschlagen. Bitte den Administrator kontaktieren."
+    st["ocr_pending"] = ocr_pending(conn, user["id"])
+    st["ocr_available"] = ocr.available()
     return st
 
 
@@ -987,9 +1011,11 @@ def rebuild_my_search_index(user=Depends(current_user), conn=Depends(get_db)):
     if left and st["state"] != "error":
         raise HTTPException(429, f"Neuindizierung ist in {max(1, round(left / 60))} Min. wieder möglich.")
     sidx.reset_user(conn, user["id"], "user", keyring)
+    requeue_ocr(conn, user["id"])   # Texterkennung für alle eigenen Anhänge erneut durchlaufen lassen
     conn.commit()
     wake_indexer()
-    return sidx.status(conn, user["id"])
+    wake_ocr()
+    return {**sidx.status(conn, user["id"]), "ocr_pending": ocr_pending(conn, user["id"])}
 
 
 @app.get("/api/me/sessions")
@@ -2097,9 +2123,29 @@ def admin_reset_search_index(user_id:int, _admin=Depends(admin_user), conn=Depen
     if not conn.execute("SELECT 1 FROM users WHERE id=?",(user_id,)).fetchone():
         raise HTTPException(404,"Benutzer nicht gefunden")
     sidx.reset_user(conn,user_id,"admin",keyring)
+    requeue_ocr(conn,user_id)
     conn.commit()
     wake_indexer()
+    wake_ocr()
     return sidx.status(conn,user_id)
+
+
+@app.get("/api/admin/ocr")
+def admin_ocr_status(_admin=Depends(admin_user), conn=Depends(get_db)):
+    total = conn.execute("SELECT COUNT(*) FROM blobs WHERE kind IN ('image','pdf')").fetchone()[0]
+    failed = conn.execute("SELECT COUNT(*) FROM blobs WHERE kind IN ('image','pdf') AND ocr_state='failed'").fetchone()[0]
+    return {"available": ocr.available(), "total": total, "pending": ocr_pending(conn), "failed": failed}
+
+
+@app.post("/api/admin/ocr/rerun")
+def admin_ocr_rerun(_admin=Depends(admin_user), conn=Depends(get_db)):
+    """Texterkennung serverweit für alle Anhänge aller Benutzer neu durchlaufen lassen; Suchindex folgt automatisch."""
+    if not ocr.available():
+        raise HTTPException(409, "Tesseract wurde auf dem Server nicht gefunden – die Texterkennung ist nicht verfügbar.")
+    n = requeue_ocr(conn)
+    conn.commit()
+    wake_ocr()
+    return {**admin_ocr_status(_admin, conn), "queued": n}
 
 
 @app.post("/api/admin/users/{user_id}/offline-cache/reset")
