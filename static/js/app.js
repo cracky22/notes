@@ -6,7 +6,7 @@ import { clearLocalAppCache, reconcileCacheGeneration } from './offline.js';
 import * as D from './dialogs.js';
 import {
   $, h, icon, iconBtn, setIcon, avatar, openModal, modals, openPopover, closePopover, popoverOwner, menu, toast, hideToast, setSnackbarsEnabled,
-  confirmDialog, captureLayout, playLayout, debounce, plural, pickFiles, shrinkImage, animate, pdfList, isPdfFile, isAttachable,
+  confirmDialog, captureLayout, playLayout, debounce, plural, pickFiles, shrinkImage, animate, pdfList, isPdfFile, isAttachable, imageSrc,
 } from './dom.js';
 import {
   state, app, store, api, AuthError, setting, updateSettings, keymap, comboFromEvent, SHORTCUT_SCOPE, hintFor,
@@ -607,15 +607,64 @@ function renderSidebar() {
     'aria-current': active ? 'page' : null,
   }, icon(iconName), h('span', { class: 'nav-label', text: label }));
   const s = state.searching;
+  const labelItem = lab => {
+    const el = item(D.isSharedLabel(lab) ? 'group' : 'label', lab.name, () => setView('label', lab.id), !s && state.view === 'label' && state.labelId === lab.id);
+    enableLabelDrop(el, lab);
+    return el;
+  };
+  // Notizen oben und Stift/Archiv/Papierkorb unten bleiben immer sichtbar, nur die Labels dazwischen scrollen
+  const labels = h('div', { class: 'nav-labels' }, D.sortedLabels().map(labelItem));
+  const keepScroll = nav.querySelector('.nav-labels')?.scrollTop || 0;
   nav.replaceChildren(
-    item('lightbulb', 'Notizen', () => setView('notes'), !s && state.view === 'notes'),
-    ...D.sortedLabels().map(lab => item('label', lab.name, () => setView('label', lab.id), !s && state.view === 'label' && state.labelId === lab.id)),
-    item('edit', 'Labels bearbeiten', D.openLabelsDialog, false),
-    item('archive', 'Archiv', () => setView('archive'), !s && state.view === 'archive'),
-    item('delete', 'Papierkorb', () => setView('trash'), !s && state.view === 'trash'));
+    h('div', { class: 'nav-fixed' }, item('lightbulb', 'Notizen', () => setView('notes'), !s && state.view === 'notes')),
+    labels,
+    h('div', { class: 'nav-fixed nav-bottom' },
+      item('edit', 'Labels bearbeiten', D.openLabelsDialog, false),
+      item('archive', 'Archiv', () => setView('archive'), !s && state.view === 'archive'),
+      item('delete', 'Papierkorb', () => setView('trash'), !s && state.view === 'trash')));
+  labels.scrollTop = keepScroll;
+  const active = labels.querySelector('.nav-item.active');
+  if (active && !keepScroll) active.scrollIntoView({ block: 'nearest' });
+}
+
+// Notizen per Drag & Drop auf ein Label im Seitenmenü ziehen
+function enableLabelDrop(el, lab) {
+  const ok = () => drag && drag.n && !drag.n.trashed && lab.can_edit !== false;
+  el.addEventListener('dragover', e => {
+    if (!ok()) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    el.classList.add('drop-target');
+    const box = el.parentElement.getBoundingClientRect();   // am Rand der Labelliste automatisch scrollen
+    if (e.clientY < box.top + 40) el.parentElement.scrollBy(0, -12);
+    else if (e.clientY > box.bottom - 40) el.parentElement.scrollBy(0, 12);
+  });
+  el.addEventListener('dragleave', () => el.classList.remove('drop-target'));
+  el.addEventListener('drop', e => {
+    el.classList.remove('drop-target');
+    if (!ok()) return;
+    e.preventDefault();
+    const n = drag.n;
+    drag = null;
+    if (n.labels.includes(lab.id)) { toast(`Schon mit „${lab.name}“ versehen`); return; }
+    patchNote(n, { labels: [...n.labels, lab.id] });
+    toast(`Label „${lab.name}“ hinzugefügt`);
+  });
 }
 
 function renderMain() {
+  // Beim Neuaufbau wird die Liste kurz leer und beim Messen zu kurz: der Browser würde nach oben klemmen.
+  // Deshalb Höhe festhalten und die Scrollposition danach wiederherstellen.
+  const area = $('#notes-area');
+  const y = window.scrollY;
+  area.style.minHeight = `${area.offsetHeight}px`;
+  try { renderMainInner(); } finally {
+    if (Math.abs(window.scrollY - y) > 1) window.scrollTo(0, y);
+    area.style.minHeight = '';
+  }
+}
+
+function renderMainInner() {
   if (deferredObserver) { deferredObserver.disconnect(); deferredObserver = null; }
   const area = $('#notes-area');
   const notice = $('#notice');
@@ -727,7 +776,7 @@ function imageGrid(images, cls) {
   for (const img of shown) {
     const ratio = img.w && img.h ? img.w / img.h : 4 / 3;
     wrap.append(h('div', { class: 'img-tile' + (img.uploading ? ' uploading' : ''), style: { aspectRatio: shown.length === 1 ? String(Math.max(0.5, Math.min(ratio, 3))) : '' } },
-      h('img', { src: img.url || `api/images/${img.id}`, alt: '', loading: 'lazy', draggable: 'false' })));
+      h('img', { src: imageSrc(img), alt: '', loading: 'lazy', draggable: 'false' })));   // Miniatur, Original erst in der Großansicht
   }
   return wrap;
 }
@@ -772,7 +821,7 @@ function buildCard(n, list) {
     card.append(h('div', { class: 'deferred-note', role: 'status', text: n._deferredPromise ? 'Archivnotiz wird geladen …' : 'Archivnotiz wird bei Bedarf vom Server geladen' }));
   } else {
     if (n.images.length) card.append(imageGrid(n.images, 'card-images'));
-    if ((n.pdfs || []).length) card.append(pdfList(n.pdfs, { cls: 'card-pdfs' }));
+    if ((n.pdfs || []).length) card.append(pdfList(n.pdfs, { cls: 'card-pdfs', onOpen: p => D.openPdfViewer(p) }));
     const hasTitle = doc.title.trim() !== '';
     if (hasTitle) card.append(h('div', { class: 'note-title', text: doc.title }));
     if (doc.is_list && doc.items.length) {
@@ -1063,6 +1112,7 @@ function openEditor(n, cardEl = null) {
     addImages: files => uploadImages(n, files),
     removeImage: img => removeImage(n, img),
     removePdf: p => removePdf(n, p),
+    viewPdf: p => D.openPdfViewer(p),
     viewImage: i => D.openLightbox(n.images, i, { onDelete: n.trashed ? null : img => removeImage(n, img) }),
     versions: () => D.openVersions(n),
     close: () => closeEditor(),

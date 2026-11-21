@@ -4,7 +4,7 @@ import { renderHTML } from './editor.js';
 import { docFromView } from './sync.js';
 import { clearLocalAppCache } from './offline.js';
 import {
-  h, icon, iconBtn, avatar, openModal, openPopover, closePopover, menu, toast, confirmDialog, fmtDate, fmtDateLong, animate,
+  h, icon, iconBtn, avatar, openModal, openPopover, closePopover, menu, toast, confirmDialog, fmtDate, fmtDateLong, animate, imageSrc,
 } from './dom.js';
 import {
   state, app, api, AuthError, setting, updateSettings, SHORTCUTS, bindingsFor, comboFromEvent, comboLabel,
@@ -17,6 +17,8 @@ export const COLORS = [
 ];
 
 const byName = (a, b) => a.name.localeCompare(b.name, 'de', { sensitivity: 'base' });
+/** Label, das mit anderen geteilt ist (als Inhaber oder als Mitglied). */
+export const isSharedLabel = lab => lab.role === 'member' || !!lab.shared;
 export const sortedLabels = () => [...state.labels].sort(byName);
 
 // ---------------------------------------------------------------------------
@@ -49,8 +51,10 @@ export function labelPicker(getIds, setIds) {
       const checked = ids.includes(lab.id);
       list.append(h('button', {
         type: 'button', class: 'check-row', role: 'menuitemcheckbox', 'aria-checked': String(checked),
+        disabled: lab.can_edit === false, title: lab.can_edit === false ? 'Nur ansehen – du darfst dieses Label nicht ändern' : null,
         onclick: () => { const cur = getIds(); setIds(checked ? cur.filter(x => x !== lab.id) : [...cur, lab.id]); draw(); },
-      }, icon(checked ? 'check_box' : 'check_box_o', 18), h('span', { text: lab.name })));
+      }, icon(checked ? 'check_box' : 'check_box_o', 18), h('span', { text: lab.name }),
+        isSharedLabel(lab) ? h('span', { class: 'label-shared-mark', title: 'Geteiltes Label' }, icon('group', 16)) : null));
     }
     if (q && !state.labels.some(l => l.name.toLocaleLowerCase() === ql)) {
       list.append(h('button', {
@@ -126,6 +130,26 @@ export function openLabelsDialog() {
   const draw = () => {
     list.replaceChildren();
     for (const lab of sortedLabels()) {
+      if (lab.role === 'member') {   // mit mir geteilt: nur ansehen oder verlassen
+        const leave = async () => {
+          if (!await confirmDialog('Du verlässt dieses geteilte Label und siehst es danach nicht mehr. Die Notizen bleiben unverändert.', 'Verlassen')) return;
+          try {
+            await api('POST', `api/labels/${lab.id}/leave`);
+            state.labels = state.labels.filter(l => l !== lab);
+            for (const n of state.notes.values()) n.labels = n.labels.filter(x => x !== lab.id);
+            if (state.view === 'label' && state.labelId === lab.id) app.setView('notes');
+            draw();
+            app.render();
+          } catch (e) { showErr(e); }
+        };
+        list.append(h('div', { class: 'labels-row shared-in' },
+          h('span', { class: 'labels-lead', title: 'Geteiltes Label' }, icon('group', 24)),
+          h('div', { class: 'labels-shared-name' },
+            h('span', { class: 'labels-name', text: lab.name }),
+            h('span', { class: 'muted', text: `geteilt von ${lab.owner ? lab.owner.username : 'einem anderen Benutzer'}${lab.can_edit === false ? ' · nur ansehen' : ''}` })),
+          iconBtn('close', 'Label verlassen', leave)));
+        continue;
+      }
       const input = h('input', { type: 'text', maxlength: '100', 'aria-label': 'Labelname' });
       input.value = lab.name;
       const commit = async () => {
@@ -154,8 +178,12 @@ export function openLabelsDialog() {
           app.render();
         } catch (e) { showErr(e); }
       };
+      const count = (lab.members || []).length;
+      const shareTitle = count ? `Geteilt mit ${count} ${count === 1 ? 'Person' : 'Personen'} – ändern` : 'Label teilen';
       list.append(h('div', { class: 'labels-row' },
-        iconBtn('delete', 'Label löschen', remove), input, iconBtn('edit', 'Label umbenennen', () => input.focus())));
+        iconBtn('delete', 'Label löschen', remove), input,
+        iconBtn(count ? 'group' : 'person_add_o', shareTitle, () => openLabelShareDialog(lab, draw), count ? 'shared-on' : ''),
+        iconBtn('edit', 'Label umbenennen', () => input.focus())));
     }
   };
   draw();
@@ -169,6 +197,80 @@ export function openLabelsDialog() {
     h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'text-btn', onclick: () => m.close() }, 'Fertig')));
   const m = openModal(content, { className: 'small', label: 'Labels bearbeiten' });
   newInput.focus();
+}
+
+// ---------------------------------------------------------------------------
+// Label teilen
+// ---------------------------------------------------------------------------
+export async function openLabelShareDialog(lab, onChange = () => {}) {
+  try {
+    const users = await api('GET', 'api/users');
+    for (const u of users) state.users.set(u.id, u);
+  } catch (e) { app.handleError(e); }
+  const me = state.user;
+  let members = (lab.members || []).map(m => ({ ...m }));
+  const list = h('div', { class: 'share-list' });
+  const err = h('div', { class: 'labels-error', role: 'alert' });
+  const input = h('input', { type: 'text', class: 'share-input', placeholder: 'Person zum Teilen eingeben', 'aria-label': 'Person zum Teilen eingeben', autocomplete: 'off' });
+  const sugg = h('div', { class: 'share-sugg', role: 'listbox' });
+  let active = 0;
+  const draw = () => {
+    list.replaceChildren(h('div', { class: 'share-row' }, avatar(me, 36),
+      h('div', { class: 'share-name' }, h('strong', { text: me.username }), h('span', { class: 'muted', text: ' (Inhaber)' }))));
+    for (const u of members) {
+      const perm = h('select', { class: 'share-perm', 'aria-label': `Rechte von ${u.username}`, onchange: () => { u.can_edit = perm.value === 'edit'; } },
+        h('option', { value: 'edit', text: 'Darf bearbeiten' }), h('option', { value: 'view', text: 'Nur ansehen' }));
+      perm.value = u.can_edit === false ? 'view' : 'edit';
+      list.append(h('div', { class: 'share-row' }, avatar(u, 36), h('div', { class: 'share-name', text: u.username }), perm,
+        iconBtn('close', 'Entfernen', () => { members = members.filter(x => x.id !== u.id); draw(); })));
+    }
+    list.append(h('div', { class: 'share-row add' }, h('span', { class: 'share-add-icon' }, icon('person_add_o', 20)), input));
+  };
+  const candidates = () => {
+    const q = input.value.trim().toLocaleLowerCase();
+    if (!q) return [];
+    const taken = new Set([me.id, ...members.map(m => m.id)]);
+    return [...state.users.values()].filter(u => !taken.has(u.id) && u.username.toLocaleLowerCase().includes(q)).slice(0, 8);
+  };
+  const add = u => { members.push({ ...u, can_edit: true }); input.value = ''; err.textContent = ''; draw(); drawSugg(); input.focus(); };
+  const drawSugg = () => {
+    const c = candidates();
+    sugg.replaceChildren(...c.map((u, i) => h('button', {
+      type: 'button', class: 'sugg-item' + (i === active ? ' active' : ''), role: 'option',
+      onmousedown: e => { e.preventDefault(); add(u); },
+    }, avatar(u, 28), h('span', { text: u.username }))));
+    if (input.value.trim() && !c.length) sugg.append(h('div', { class: 'sugg-empty', text: 'Kein Benutzer gefunden' }));
+    sugg.classList.toggle('hidden', !input.value.trim());
+  };
+  input.addEventListener('input', () => { active = 0; drawSugg(); });
+  input.addEventListener('keydown', e => {
+    const c = candidates();
+    if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(active + 1, c.length - 1); drawSugg(); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(active - 1, 0); drawSugg(); }
+    if (e.key === 'Enter') { e.preventDefault(); if (c[active]) add(c[active]); else save(); }
+  });
+  const save = async () => {
+    err.textContent = '';
+    try {
+      const res = await api('PUT', `api/labels/${lab.id}/members`, { members: members.map(x => ({ id: x.id, can_edit: x.can_edit !== false })) });
+      Object.assign(lab, res);
+      m.close();
+      onChange();
+      app.render();
+    } catch (e) { if (!(e instanceof AuthError)) err.textContent = e.message; }
+  };
+  draw();
+  const content = h('div', { class: 'dialog share-dialog' },
+    h('h3', { class: 'dialog-title', text: `Label „${lab.name}“ teilen` }),
+    h('p', { class: 'share-hint', text: 'Mitglieder sehen dieses Label an Notizen, auf die sie ohnehin Zugriff haben. „Darf bearbeiten“ erlaubt ihnen, es an Notizen zu vergeben und zu entfernen. Zugriff auf weitere Notizen gibt das Teilen nicht.' }),
+    h('div', { class: 'share-body' }, list, sugg),
+    err,
+    h('div', { class: 'dialog-actions' },
+      h('button', { type: 'button', class: 'text-btn', onclick: () => m.close() }, 'Abbrechen'),
+      h('button', { type: 'button', class: 'text-btn primary', onclick: save }, 'Speichern')));
+  drawSugg();
+  const m = openModal(content, { className: 'small share', label: 'Label teilen' });
+  input.focus();
 }
 
 // ---------------------------------------------------------------------------
@@ -316,9 +418,17 @@ export function openLightbox(images, index, { onDelete } = {}) {
   const prev = iconBtn('arrow_back', 'Vorheriges Bild', () => go(-1), 'lb-nav lb-prev');
   const next = iconBtn('arrow_back', 'Nächstes Bild', () => go(1), 'lb-nav lb-next');
   const go = d => { i = (i + d + images.length) % images.length; show(); };
+  let token = 0;
   const show = () => {
     const it = images[i];
-    img.src = it.url || `api/images/${it.id}`;
+    // Sofort die (meist schon geladene) Miniatur zeigen, das Original erst jetzt im Hintergrund nachladen
+    const mine = ++token;
+    img.src = imageSrc(it);
+    if (!it.url) {
+      const full = new Image();
+      full.onload = () => { if (mine === token) img.src = imageSrc(it, { full: true }); };
+      full.src = imageSrc(it, { full: true });
+    }
     counter.textContent = images.length > 1 ? `${i + 1} / ${images.length}` : '';
     prev.classList.toggle('hidden', images.length < 2);
     next.classList.toggle('hidden', images.length < 2);
@@ -332,6 +442,107 @@ export function openLightbox(images, index, { onDelete } = {}) {
   const m = openModal(content, { className: 'lightbox-modal', label: 'Bild' });
   show();
   content.focus();
+}
+
+// ---------------------------------------------------------------------------
+// PDF-Vorschau: Seiten werden auf dem Server gerendert und beim Scrollen nachgeladen (kein Download nötig)
+// ---------------------------------------------------------------------------
+export async function openPdfViewer(pdf) {
+  const base = `api/pdfs/${pdf.id}`;
+  const ZOOMS = [0.6, 0.8, 1, 1.25, 1.5, 2, 2.5];
+  let zi = 2;
+  let sizes = [];
+  let pageEls = [];
+  const counter = h('span', { class: 'lb-count pv-count', text: pdf.pages ? `Seite 1 / ${pdf.pages}` : '' });
+  const pages = h('div', { class: 'pv-pages' });
+  const scroll = h('div', { class: 'pv-scroll', tabIndex: 0 }, pages);
+  const zoomOut = iconBtn('zoom_out', 'Verkleinern', () => setZoom(zi - 1));
+  const zoomIn = iconBtn('zoom_in', 'Vergrößern', () => setZoom(zi + 1));
+  const bar = h('div', { class: 'lb-bar pv-bar' },
+    iconBtn('arrow_back', 'Schließen', () => m.close()),
+    h('span', { class: 'pv-title', title: pdf.name, text: pdf.name }),
+    counter, h('span', { class: 'grow' }), zoomOut, zoomIn,
+    h('a', { class: 'icon-btn', href: base, download: pdf.name, title: 'Herunterladen', 'aria-label': 'Herunterladen' }, icon('download')),
+    h('a', { class: 'icon-btn', href: base, target: '_blank', rel: 'noopener', title: 'In neuem Tab öffnen', 'aria-label': 'In neuem Tab öffnen' }, icon('open_in_new')));
+  const content = h('div', { class: 'lightbox pdf-viewer' }, bar, scroll);
+  content.tabIndex = -1;
+  const m = openModal(content, { className: 'lightbox-modal pdf-modal', label: `PDF: ${pdf.name}` });
+  scroll.focus({ preventScroll: true });
+
+  const baseWidth = () => Math.max(220, Math.min(scroll.clientWidth - 24, 900));
+  const shownWidth = () => Math.round(baseWidth() * ZOOMS[zi]);
+  const wantW = () => Math.round(shownWidth() * Math.min(window.devicePixelRatio || 1, 2));
+  const ratioOf = i => (sizes[i] ? sizes[i][1] / sizes[i][0] : 1.414);
+
+  const layout = () => {
+    const w = shownWidth();
+    pageEls.forEach((el, i) => { el.style.width = `${w}px`; el.style.aspectRatio = `${1} / ${ratioOf(i)}`; });
+  };
+  const load = (el, i) => {
+    const w = wantW();
+    const bucket = Math.round(w / 100) * 100;   // so rundet auch der Server
+    if (el.dataset.w === String(bucket)) return;
+    el.dataset.w = String(bucket);
+    const im = el.querySelector('img') || el.appendChild(h('img', { alt: `Seite ${i + 1}`, draggable: 'false' }));
+    im.addEventListener('load', () => el.classList.add('loaded'), { once: true });
+    im.addEventListener('error', () => el.classList.add('failed'), { once: true });
+    im.src = `${base}/pages/${i}?w=${w}`;
+  };
+  const seen = new Set();
+  const io = typeof IntersectionObserver === 'function' ? new IntersectionObserver(entries => {
+    for (const e of entries) {
+      const i = Number(e.target.dataset.i);
+      if (e.isIntersecting) { seen.add(i); load(e.target, i); } else seen.delete(i);
+    }
+  }, { root: scroll, rootMargin: '700px 0px' }) : null;
+
+  let zoomTimer = null;
+  const setZoom = next => {
+    zi = Math.max(0, Math.min(ZOOMS.length - 1, next));
+    zoomOut.disabled = zi === 0;
+    zoomIn.disabled = zi === ZOOMS.length - 1;
+    // aktuelle Seite beibehalten
+    const keep = currentPage();
+    layout();
+    pageEls[keep] && scroll.scrollTo({ top: pageEls[keep].offsetTop });
+    clearTimeout(zoomTimer);
+    zoomTimer = setTimeout(() => { for (const i of seen) load(pageEls[i], i); }, 200);   // schärfer nachladen
+  };
+  const currentPage = () => {
+    const mid = scroll.scrollTop + scroll.clientHeight / 3;
+    let cur = 0;
+    for (let i = 0; i < pageEls.length; i++) { if (pageEls[i].offsetTop <= mid) cur = i; else break; }
+    return cur;
+  };
+  let frame = 0;
+  scroll.addEventListener('scroll', () => {
+    if (frame) return;
+    frame = requestAnimationFrame(() => {
+      frame = 0;
+      if (pageEls.length) counter.textContent = `Seite ${currentPage() + 1} / ${pageEls.length}`;
+    });
+  }, { passive: true });
+  let resizeTimer = null;
+  const onResize = () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { layout(); for (const i of seen) load(pageEls[i], i); }, 150); };
+  window.addEventListener('resize', onResize);
+  const prevClose = m.onClose;
+  m.onClose = () => { window.removeEventListener('resize', onResize); io && io.disconnect(); clearTimeout(zoomTimer); if (prevClose) prevClose(); };
+
+  try {
+    const info = await api('GET', `${base}/info`);
+    sizes = info.sizes || [];
+    const count = info.pages || sizes.length;
+    pageEls = Array.from({ length: count }, (_, i) => h('div', { class: 'pv-page', dataset: { i: String(i) } }));
+    pages.append(...pageEls);
+    layout();
+    setZoom(zi);
+    counter.textContent = `Seite 1 / ${count}`;
+    if (io) pageEls.forEach(el => io.observe(el)); else pageEls.slice(0, 5).forEach((el, i) => load(el, i));
+  } catch (e) {
+    if (e instanceof AuthError) { m.close(); return; }
+    pages.replaceChildren(h('div', { class: 'pv-error' }, h('p', { text: e.message || 'Die Vorschau ist nicht verfügbar.' }),
+      h('a', { class: 'text-btn', href: base, target: '_blank', rel: 'noopener' }, 'PDF in neuem Tab öffnen')));
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -55,7 +55,7 @@ MAX_IMAGE_SIDE = 2560
 AVATAR_SIDE = 256
 MAX_PDF_BYTES = 40 * 1024 * 1024
 MAX_PDF_PAGES = 150
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{3,64}$")
 MIN_PASSWORD_LEN = 8
@@ -270,6 +270,27 @@ CREATE TABLE IF NOT EXISTS note_labels (
     PRIMARY KEY (note_id, label_id)
 );
 
+-- Geteilte Labels: der Inhaber (labels.user_id) gibt ein Label für weitere Benutzer frei.
+-- Mitglieder sehen es in ihrer Seitenleiste und dürfen es an Notizen setzen/entfernen, die sie ohnehin sehen.
+CREATE TABLE IF NOT EXISTS label_members (
+    label_id  INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    added_at  INTEGER NOT NULL,
+    can_edit  INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (label_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_label_members_user ON label_members(user_id);
+
+-- Vorschaubilder (Miniaturen) zu Bildern und ersten PDF-Seiten, bei Bedarf erzeugt und dann zwischengespeichert (kein Semikolon in Kommentaren: alte Migrationen teilen SCHEMA daran)
+CREATE TABLE IF NOT EXISTS blob_thumbs (
+    blob_id  INTEGER PRIMARY KEY REFERENCES blobs(id) ON DELETE CASCADE,
+    mime     TEXT NOT NULL,
+    width    INTEGER NOT NULL,
+    height   INTEGER NOT NULL,
+    key_id   TEXT NOT NULL,
+    data     BLOB NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
@@ -330,6 +351,9 @@ def prepare_db(conn: sqlite3.Connection, keyring: "KeyRing | None" = None) -> No
             version = 6
         if version == 6:
             _migrate_6_to_7(conn)
+            version = 7
+        if version == 7:
+            _migrate_7_to_8(conn)
     elif version > SCHEMA_VERSION:
         raise RuntimeError("Die Datenbank stammt von einer neueren Programmversion.")
     try:
@@ -495,6 +519,31 @@ def _migrate_6_to_7(conn: sqlite3.Connection) -> None:
     print("Migration auf Schema v7 abgeschlossen (PDF-Anhänge, OCR).")
 
 
+def _migrate_7_to_8(conn: sqlite3.Connection) -> None:
+    """Neue Tabellen: geteilte Labels (label_members) und Miniaturen (blob_thumbs). Nur Ergänzungen."""
+    conn.commit()
+    conn.execute("BEGIN")
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS label_members (
+                label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                added_at INTEGER NOT NULL, can_edit INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (label_id, user_id));
+            CREATE INDEX IF NOT EXISTS idx_label_members_user ON label_members(user_id);
+            CREATE TABLE IF NOT EXISTS blob_thumbs (
+                blob_id INTEGER PRIMARY KEY REFERENCES blobs(id) ON DELETE CASCADE,
+                mime TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+                key_id TEXT NOT NULL, data BLOB NOT NULL);
+        """)
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '8')")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    print("Migration auf Schema v8 abgeschlossen (geteilte Labels, Miniaturen).")
+
+
 def key_ids_in_db(conn: sqlite3.Connection) -> dict[str, int]:
     """Zählt, wie viele verschlüsselte Datensätze mit welcher Schlüssel-ID existieren."""
     counts: dict[str, int] = {}
@@ -505,9 +554,10 @@ def key_ids_in_db(conn: sqlite3.Connection) -> dict[str, int]:
         for kid, n in conn.execute(f"SELECT substr({col}, 1, instr({col}, ':') - 1) AS kid, COUNT(*) "
                                    f"FROM {table} WHERE {col} IS NOT NULL GROUP BY kid"):
             counts[kid] = counts.get(kid, 0) + n
-    if "blobs" in tables:
-        for kid, n in conn.execute("SELECT key_id, COUNT(*) FROM blobs GROUP BY key_id"):
-            counts[kid] = counts.get(kid, 0) + n
+    for table in ("blobs", "blob_thumbs"):
+        if table in tables:
+            for kid, n in conn.execute(f"SELECT key_id, COUNT(*) FROM {table} GROUP BY key_id"):
+                counts[kid] = counts.get(kid, 0) + n
     return counts
 
 
@@ -666,6 +716,11 @@ def reencrypt_all(conn: sqlite3.Connection, ring: KeyRing, new_kid: str) -> int:
         nkid, blob = ring.encrypt_bytes(ring.decrypt_bytes(kid, data))
         conn.execute("UPDATE blobs SET key_id = ?, data = ? WHERE id = ?", (nkid, blob, rid))
         changed += 1
+    for rid, kid in conn.execute("SELECT blob_id, key_id FROM blob_thumbs WHERE key_id <> ?", (new_kid,)).fetchall():
+        data = conn.execute("SELECT data FROM blob_thumbs WHERE blob_id = ?", (rid,)).fetchone()[0]
+        nkid, blob = ring.encrypt_bytes(ring.decrypt_bytes(kid, data))
+        conn.execute("UPDATE blob_thumbs SET key_id = ?, data = ? WHERE blob_id = ?", (nkid, blob, rid))
+        changed += 1
     return changed
 
 
@@ -779,6 +834,87 @@ def process_image(data: bytes) -> tuple[bytes, str, int, int]:
         im.save(out, "JPEG", quality=86, optimize=True, progressive=True)
         mime = "image/jpeg"
     return out.getvalue(), mime, im.width, im.height
+
+
+# PDFium ist nicht threadsicher: Vorschau-Rendering und OCR-Worker teilen sich diese Sperre.
+PDFIUM_LOCK = threading.RLock()
+THUMB_SIDE = 480           # längste Kante der Miniatur in Pixeln (Karten zeigen max. ~300 px, Retina ×1,6)
+PDF_THUMB_WIDTH = 420
+
+
+def _jpeg_bytes(im, quality: int = 78) -> bytes:
+    out = io.BytesIO()
+    im.convert("RGB").save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+    return out.getvalue()
+
+
+def make_thumb(data: bytes, side: int = THUMB_SIDE) -> tuple[bytes, str, int, int]:
+    """Verkleinerte Vorschau eines (bereits verarbeiteten) Bildes. Transparente Bilder bleiben PNG."""
+    from PIL import Image
+    im = _open_image(data)
+    alpha = im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info)
+    im.thumbnail((side, side), Image.LANCZOS)
+    if alpha:
+        out = io.BytesIO()
+        im.convert("RGBA").save(out, "PNG", optimize=True)
+        return out.getvalue(), "image/png", im.width, im.height
+    return _jpeg_bytes(im), "image/jpeg", im.width, im.height
+
+
+def render_pdf_page(data: bytes, page: int, width: int) -> tuple[bytes, int, int, int]:
+    """Rendert Seite `page` (ab 0) einer PDF-Datei auf die Breite `width` (px) als JPEG.
+
+    Rückgabe: (JPEG-Bytes, Breite, Höhe, Seitenzahl). Fehler: ImageError."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:  # pragma: no cover
+        raise ImageError("Für die PDF-Vorschau wird das Paket 'pypdfium2' benötigt (pip install pypdfium2).") from exc
+    with PDFIUM_LOCK:
+        try:
+            doc = pdfium.PdfDocument(data)
+        except Exception as exc:  # noqa: BLE001
+            raise ImageError("Die PDF-Datei kann nicht angezeigt werden.") from exc
+        try:
+            total = len(doc)
+            if not 0 <= page < total:
+                raise ImageError("Seite nicht vorhanden.")
+            pg = doc[page]
+            w_pt = max(pg.get_width(), 1.0)
+            scale = max(0.1, min(width / w_pt, 6.0))
+            try:
+                im = pg.render(scale=scale).to_pil().convert("RGB")
+            except Exception as exc:  # noqa: BLE001
+                raise ImageError("Die Seite kann nicht gerendert werden.") from exc
+        finally:
+            try:
+                doc.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return _jpeg_bytes(im, 82), im.width, im.height, total
+
+
+def pdf_page_sizes(data: bytes) -> list[list[float]]:
+    """[[Breite, Höhe], …] aller Seiten in PDF-Punkten (unter Berücksichtigung der Seitendrehung)."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:  # pragma: no cover
+        raise ImageError("Für die PDF-Vorschau wird das Paket 'pypdfium2' benötigt (pip install pypdfium2).") from exc
+    with PDFIUM_LOCK:
+        try:
+            doc = pdfium.PdfDocument(data)
+        except Exception as exc:  # noqa: BLE001
+            raise ImageError("Die PDF-Datei kann nicht angezeigt werden.") from exc
+        try:
+            sizes = []
+            for i in range(len(doc)):
+                pg = doc[i]
+                sizes.append([round(pg.get_width(), 1), round(pg.get_height(), 1)])
+            return sizes
+        finally:
+            try:
+                doc.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def process_avatar(data: bytes) -> bytes:

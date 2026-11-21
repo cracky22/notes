@@ -738,7 +738,8 @@ def note_views(conn, user_id: int, note_id: int | None = None, note_ids: list[in
     labels: dict[int, list] = defaultdict(list)
     for r in conn.execute(
             f"SELECT nl.note_id, nl.label_id FROM note_labels nl JOIN labels l ON l.id = nl.label_id "
-            f"WHERE l.user_id = ? AND nl.note_id IN ({sub})", [user_id, *sub_params]):
+            f"WHERE (l.user_id = ? OR l.id IN (SELECT label_id FROM label_members WHERE user_id = ?)) "
+            f"AND nl.note_id IN ({sub})", [user_id, user_id, *sub_params]):
         labels[r["note_id"]].append(r["label_id"])
     out = []
     for r in rows:
@@ -794,16 +795,31 @@ def next_position(conn, user_id: int) -> float:
     return (cur or 0) + 1
 
 
+ACCESSIBLE_LABELS = ("SELECT id FROM labels WHERE user_id = ? "
+                     "UNION SELECT label_id FROM label_members WHERE user_id = ?")
+# Labels, die der Benutzer an Notizen setzen/entfernen darf: eigene + geteilte mit Bearbeitungsrecht
+EDITABLE_LABELS = ("SELECT id FROM labels WHERE user_id = ? "
+                   "UNION SELECT label_id FROM label_members WHERE user_id = ? AND can_edit = 1")
+
+
 def set_labels(conn, user_id: int, note_id: int, label_ids: list[int]) -> None:
+    """Setzt die Labels einer Notiz aus Sicht eines Benutzers (eigene + mit ihm geteilte Labels)."""
     ids = sorted(set(label_ids))
     if ids:
         marks = ",".join("?" * len(ids))
         valid = {r[0] for r in conn.execute(
-            f"SELECT id FROM labels WHERE user_id = ? AND id IN ({marks})", (user_id, *ids))}
+            f"SELECT id FROM ({ACCESSIBLE_LABELS}) WHERE id IN ({marks})", (user_id, user_id, *ids))}
         if len(valid) != len(ids):
             raise HTTPException(400, "Unbekanntes Label")
-    conn.execute("DELETE FROM note_labels WHERE note_id = ? AND label_id IN "
-                 "(SELECT id FROM labels WHERE user_id = ?)", (note_id, user_id))
+    # Schreibgeschützte geteilte Labels dürfen weder neu gesetzt noch entfernt werden
+    readonly = {r[0] for r in conn.execute(
+        "SELECT label_id FROM label_members WHERE user_id = ? AND can_edit = 0", (user_id,))}
+    current = {r[0] for r in conn.execute("SELECT label_id FROM note_labels WHERE note_id = ?", (note_id,))}
+    if (set(ids) & readonly) - current:
+        raise HTTPException(403, "Du darfst dieses geteilte Label nicht vergeben.")
+    ids = sorted((set(ids) - readonly) )
+    conn.execute(f"DELETE FROM note_labels WHERE note_id = ? AND label_id IN ({EDITABLE_LABELS})",
+                 (note_id, user_id, user_id))
     conn.executemany("INSERT INTO note_labels(note_id, label_id) VALUES (?, ?)", [(note_id, i) for i in ids])
 
 
@@ -1303,7 +1319,8 @@ def update_note(note_id: int, body: NotePatch, request: Request, user=Depends(cu
     if "archived" in changes:
         sync_note_compression(conn,note_id)
     conn.commit()
-    targets = participants(conn, note_id) if shared_change else [uid]
+    # Labels können geteilt sein: dann ändert sich die Sicht der anderen Teilnehmer ebenfalls
+    targets = participants(conn, note_id) if shared_change or "labels" in changes else [uid]
     publish_note(conn, note_id, targets, exclude_client=client_of(request))
     return one_view(conn, uid, note_id)
 
@@ -1335,8 +1352,11 @@ def leave_note(note_id: int, request: Request, user=Depends(current_user), conn=
 
 def _remove_member(conn, note_id: int, user_id: int) -> None:
     conn.execute("DELETE FROM note_users WHERE note_id = ? AND user_id = ?", (note_id, user_id))
+    # eigene Labels des Benutzers verschwinden von der Notiz – außer ein anderer Teilnehmer sieht sie über eine Freigabe
     conn.execute("DELETE FROM note_labels WHERE note_id = ? AND label_id IN "
-                 "(SELECT id FROM labels WHERE user_id = ?)", (note_id, user_id))
+                 "(SELECT l.id FROM labels l WHERE l.user_id = ? AND NOT EXISTS ("
+                 " SELECT 1 FROM label_members lm JOIN note_users nu ON nu.user_id = lm.user_id AND nu.note_id = ? "
+                 " WHERE lm.label_id = l.id))", (note_id, user_id, note_id))
     sidx.drop_member(conn, note_id, user_id)
 
 
@@ -1390,7 +1410,8 @@ def copy_note(note_id: int, request: Request, user=Depends(current_user), conn=D
     conn.execute("INSERT INTO note_users(note_id, user_id, role, position, added_at) VALUES (?,?,'owner',?,?)",
                  (nid, uid, next_position(conn, uid), t))
     conn.execute("INSERT INTO note_labels(note_id, label_id) SELECT ?, nl.label_id FROM note_labels nl "
-                 "JOIN labels l ON l.id = nl.label_id WHERE nl.note_id = ? AND l.user_id = ?", (nid, note_id, uid))
+                 "JOIN labels l ON l.id = nl.label_id WHERE nl.note_id = ? AND (l.user_id = ? OR l.id IN "
+                 "(SELECT label_id FROM label_members WHERE user_id = ?))", (nid, note_id, uid, uid))
     conn.execute("INSERT INTO blobs(owner_id, note_id, kind, mime, width, height, size, key_id, data, created_at, "
                  "name, ocr_text, ocr_state, pages) "
                  "SELECT ?, ?, kind, mime, width, height, size, key_id, data, ?, name, ocr_text, ocr_state, pages "
@@ -1452,11 +1473,19 @@ async def upload_image(note_id: int, request: Request, user=Depends(current_user
     except core.ImageError as exc:
         raise HTTPException(400, str(exc)) from exc
     enforce_quota(conn,user["id"],len(out))
+    thumb = None
+    if max(w, h) > core.THUMB_SIDE:
+        try:
+            thumb = await run_in_threadpool(core.make_thumb, out)
+        except core.ImageError:
+            thumb = None   # wird bei Bedarf später erneut versucht
     kid, blob = keyring.encrypt_bytes(out)
     t = core.now()
     cur = conn.execute("INSERT INTO blobs(owner_id, note_id, kind, mime, width, height, size, key_id, data, "
                        "created_at, ocr_state) VALUES (?,?,'image',?,?,?,?,?,?,?,'pending')",
                        (user["id"], note_id, mime, w, h, len(out), kid, blob, t))
+    if thumb:
+        _store_thumb(conn, cur.lastrowid, thumb)
     conn.execute("UPDATE notes SET updated_at = ?, updated_by = ? WHERE id = ?", (t, user["id"], note_id))
     conn.commit()
     wake_ocr()
@@ -1486,9 +1515,155 @@ def get_image(image_id: int, user=Depends(current_user), conn=Depends(get_db)):
                     headers={"Cache-Control": "private, max-age=31536000, immutable"})
 
 
+IMMUTABLE = {"Cache-Control": "private, max-age=31536000, immutable"}
+
+
+def _store_thumb(conn, blob_id: int, thumb: tuple[bytes, str, int, int]) -> None:
+    data, mime, w, h = thumb
+    kid, enc = keyring.encrypt_bytes(data)
+    conn.execute("INSERT OR REPLACE INTO blob_thumbs(blob_id, mime, width, height, key_id, data) VALUES (?,?,?,?,?,?)",
+                 (blob_id, mime, w, h, kid, enc))
+
+
+def _cached_thumb(conn, blob_id: int) -> Response | None:
+    row = conn.execute("SELECT mime, key_id, data FROM blob_thumbs WHERE blob_id = ?", (blob_id,)).fetchone()
+    if not row:
+        return None
+    return Response(keyring.decrypt_bytes(row["key_id"], row["data"]), media_type=row["mime"], headers=IMMUTABLE)
+
+
+@app.get("/api/images/{image_id}/thumb")
+def get_image_thumb(image_id: int, user=Depends(current_user), conn=Depends(get_db)):
+    """Miniatur für Notizkarten und Editor; das Original wird erst beim Öffnen der Großansicht geladen."""
+    row = conn.execute(
+        "SELECT b.id, b.width, b.height FROM blobs b JOIN note_users nu ON nu.note_id = b.note_id "
+        "WHERE b.id = ? AND b.kind = 'image' AND nu.user_id = ?", (image_id, user["id"])).fetchone()
+    if not row:
+        raise HTTPException(404, "Bild nicht gefunden")
+    hit = _cached_thumb(conn, image_id)
+    if hit:
+        return hit
+    src = conn.execute("SELECT mime, key_id, data FROM blobs WHERE id = ?", (image_id,)).fetchone()
+    original = keyring.decrypt_bytes(src["key_id"], src["data"])
+    if max(row["width"], row["height"]) <= core.THUMB_SIDE:
+        return Response(original, media_type=src["mime"], headers=IMMUTABLE)   # schon klein genug
+    try:
+        thumb = core.make_thumb(original)
+    except core.ImageError:
+        return Response(original, media_type=src["mime"], headers=IMMUTABLE)
+    _store_thumb(conn, image_id, thumb)
+    conn.commit()
+    return Response(thumb[0], media_type=thumb[1], headers=IMMUTABLE)
+
+
 # --------------------------------------------------------------------------- #
 # Routen: PDF-Anhänge (mit OCR im Hintergrund)
 # --------------------------------------------------------------------------- #
+class _ByteLRU:
+    """Kleiner Byte-begrenzter LRU-Cache (entschlüsselte PDFs, gerenderte Seiten)."""
+
+    def __init__(self, budget: int):
+        from collections import OrderedDict
+        self.budget, self.used, self.items = budget, 0, OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        with self.lock:
+            val = self.items.get(key)
+            if val is not None:
+                self.items.move_to_end(key)
+            return val
+
+    def put(self, key, val, size: int) -> None:
+        if size > self.budget:
+            return
+        with self.lock:
+            if key in self.items:
+                self.used -= self.items.pop(key)[1]
+            self.items[key] = (val, size)
+            self.used += size
+            while self.used > self.budget and self.items:
+                _, (_, s) = self.items.popitem(last=False)
+                self.used -= s
+
+
+_MB = 1024 * 1024
+_pdf_cache = _ByteLRU(int(os.environ.get("NOTIZEN_PDF_CACHE_MB", "64")) * _MB)
+_page_cache = _ByteLRU(int(os.environ.get("NOTIZEN_PDF_PAGE_CACHE_MB", "32")) * _MB)
+
+
+def _pdf_access(conn, pdf_id: int, user_id: int):
+    row = conn.execute(
+        "SELECT b.id, b.size, b.ocr_state, b.pages FROM blobs b JOIN note_users nu ON nu.note_id = b.note_id "
+        "WHERE b.id = ? AND b.kind = 'pdf' AND nu.user_id = ?", (pdf_id, user_id)).fetchone()
+    if not row:
+        raise HTTPException(404, "PDF nicht gefunden")
+    return row
+
+
+def _pdf_bytes(conn, row) -> bytes:
+    key = (row["id"], row["size"], row["ocr_state"])
+    hit = _pdf_cache.get(key)
+    if hit is not None:
+        return hit[0]
+    src = conn.execute("SELECT key_id, data FROM blobs WHERE id = ?", (row["id"],)).fetchone()
+    data = keyring.decrypt_bytes(src["key_id"], src["data"])
+    _pdf_cache.put(key, data, len(data))
+    return data
+
+
+@app.get("/api/pdfs/{pdf_id}/thumb")
+def get_pdf_thumb(pdf_id: int, user=Depends(current_user), conn=Depends(get_db)):
+    """Erste Seite als Miniatur (für die Notizkarte)."""
+    row = _pdf_access(conn, pdf_id, user["id"])
+    hit = _cached_thumb(conn, pdf_id)
+    if hit:
+        return hit
+    try:
+        jpg, w, h, _ = core.render_pdf_page(_pdf_bytes(conn, row), 0, core.PDF_THUMB_WIDTH)
+    except core.ImageError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    _store_thumb(conn, pdf_id, (jpg, "image/jpeg", w, h))
+    conn.commit()
+    return Response(jpg, media_type="image/jpeg", headers=IMMUTABLE)
+
+
+@app.get("/api/pdfs/{pdf_id}/info")
+def get_pdf_info(pdf_id: int, user=Depends(current_user), conn=Depends(get_db)):
+    """Seitenzahl und Seitenmaße (pt) – damit die Vorschau den Platz reservieren kann, bevor Seiten laden."""
+    row = _pdf_access(conn, pdf_id, user["id"])
+    key = ("info", row["id"], row["size"], row["ocr_state"])
+    hit = _page_cache.get(key)
+    if hit is None:
+        try:
+            sizes = core.pdf_page_sizes(_pdf_bytes(conn, row))
+        except core.ImageError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        _page_cache.put(key, sizes, 64 + 16 * len(sizes))
+    else:
+        sizes = hit[0]
+    return {"pages": len(sizes), "sizes": sizes}
+
+
+@app.get("/api/pdfs/{pdf_id}/pages/{page}")
+def get_pdf_page(pdf_id: int, page: int, w: int = 900, user=Depends(current_user), conn=Depends(get_db)):
+    """Eine PDF-Seite als JPEG (Seitennummer ab 0, Breite in px) – die Datei muss nicht heruntergeladen werden."""
+    row = _pdf_access(conn, pdf_id, user["id"])
+    if page < 0 or (row["pages"] and page >= row["pages"]):
+        raise HTTPException(404, "Seite nicht vorhanden")
+    width = max(200, min(2000, int(round(w / 100.0)) * 100))
+    key = (row["id"], row["size"], row["ocr_state"], page, width)
+    hit = _page_cache.get(key)
+    if hit is None:
+        try:
+            jpg = core.render_pdf_page(_pdf_bytes(conn, row), page, width)[0]
+        except core.ImageError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        _page_cache.put(key, jpg, len(jpg))
+    else:
+        jpg = hit[0]
+    return Response(jpg, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
 def clean_filename(name: str) -> str:
     name = re.sub(r"[\x00-\x1f\x7f/\\]", "", name or "").strip()[:120]
     if not name:
@@ -1617,9 +1792,34 @@ async def restore_version(note_id: int, version_id: int, user=Depends(current_us
 # Routen: Labels
 # --------------------------------------------------------------------------- #
 def _label_list(conn, user_id: int) -> list[dict]:
-    labels = [{"id": r["id"], "name": keyring.decrypt(r["name"])}
-              for r in conn.execute("SELECT id, name FROM labels WHERE user_id = ?", (user_id,))]
+    """Eigene Labels und mit dem Benutzer geteilte Labels (inkl. Inhaber und Mitglieder)."""
+    rows = conn.execute(
+        "SELECT id, name, user_id FROM labels WHERE user_id = ? "
+        "OR id IN (SELECT label_id FROM label_members WHERE user_id = ?)", (user_id, user_id)).fetchall()
+    if not rows:
+        return []
+    ids = [r["id"] for r in rows]
+    marks = ",".join("?" * len(ids))
+    members: dict[int, list] = defaultdict(list)
+    for r in conn.execute(
+            f"SELECT lm.label_id, lm.can_edit, u.id, u.username, u.avatar_id FROM label_members lm "
+            f"JOIN users u ON u.id = lm.user_id WHERE lm.label_id IN ({marks}) ORDER BY lm.added_at, u.id", ids):
+        members[r["label_id"]].append({**user_view(r), "can_edit": bool(r["can_edit"])})
+    owner_ids = tuple({r["user_id"] for r in rows})
+    owners = {r["id"]: user_view(r) for r in conn.execute(
+        f"SELECT id, username, avatar_id FROM users WHERE id IN ({','.join('?' * len(owner_ids))})", owner_ids)}
+    labels = [{"id": r["id"], "name": keyring.decrypt(r["name"]), "owner_id": r["user_id"],
+               "owner": owners.get(r["user_id"]), "role": "owner" if r["user_id"] == user_id else "member",
+               "can_edit": r["user_id"] == user_id or any(m["id"] == user_id and m["can_edit"] for m in members.get(r["id"], [])),
+               "members": members.get(r["id"], []), "shared": bool(members.get(r["id"]))} for r in rows]
     return sorted(labels, key=lambda lab: lab["name"].casefold())
+
+
+def _label_dict(conn, user_id: int, label_id: int) -> dict:
+    for lab in _label_list(conn, user_id):
+        if lab["id"] == label_id:
+            return lab
+    raise HTTPException(404, "Label nicht gefunden")
 
 
 def _ensure_unique_label(conn, user_id: int, name: str, exclude: int | None = None) -> None:
@@ -1627,6 +1827,30 @@ def _ensure_unique_label(conn, user_id: int, name: str, exclude: int | None = No
     for lab in _label_list(conn, user_id):
         if lab["id"] != exclude and lab["name"].casefold() == key:
             raise HTTPException(409, "Ein Label mit diesem Namen existiert bereits.")
+
+
+def _own_label(conn, user_id: int, label_id: int):
+    """Label, das dem Benutzer gehört; für Mitglieder 403, für Fremde 404."""
+    row = conn.execute("SELECT id, user_id, name FROM labels WHERE id = ?", (label_id,)).fetchone()
+    if row and row["user_id"] != user_id and conn.execute(
+            "SELECT 1 FROM label_members WHERE label_id = ? AND user_id = ?", (label_id, user_id)).fetchone():
+        raise HTTPException(403, "Nur der Inhaber kann dieses geteilte Label ändern.")
+    if not row or row["user_id"] != user_id:
+        raise HTTPException(404, "Label nicht gefunden")
+    return row
+
+
+def _label_audience(conn, label_id: int) -> set[int]:
+    owner = conn.execute("SELECT user_id FROM labels WHERE id = ?", (label_id,)).fetchone()
+    users = {r[0] for r in conn.execute("SELECT user_id FROM label_members WHERE label_id = ?", (label_id,))}
+    return users | ({owner[0]} if owner else set())
+
+
+def _refresh_label_notes(conn, note_ids, user_ids, request: Request | None = None) -> None:
+    """Schickt den betroffenen Benutzern die neue Sicht der Notizen, die sie sehen und die das Label tragen."""
+    users = set(user_ids)
+    for nid in note_ids:
+        publish_note(conn, nid, users & set(participants(conn, nid)), exclude_client=client_of(request) if request else None)
 
 
 @app.get("/api/labels")
@@ -1643,7 +1867,7 @@ def create_label(body: LabelIn, request: Request, user=Depends(current_user), co
     cur = conn.execute("INSERT INTO labels(user_id, name) VALUES (?, ?)", (user["id"], keyring.encrypt(name)))
     conn.commit()
     hub.publish([user["id"]], {"t": "labels"}, exclude_client=client_of(request))
-    return {"id": cur.lastrowid, "name": name}
+    return _label_dict(conn, user["id"], cur.lastrowid)
 
 
 @app.patch("/api/labels/{label_id}")
@@ -1651,20 +1875,84 @@ def rename_label(label_id: int, body: LabelIn, request: Request, user=Depends(cu
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Der Labelname darf nicht leer sein.")
-    if not conn.execute("SELECT 1 FROM labels WHERE id = ? AND user_id = ?", (label_id, user["id"])).fetchone():
-        raise HTTPException(404, "Label nicht gefunden")
-    _ensure_unique_label(conn, user["id"], name, exclude=label_id)
+    _own_label(conn, user["id"], label_id)
+    audience = _label_audience(conn, label_id)
+    for uid in audience:   # der neue Name darf bei keinem Beteiligten doppelt vorkommen
+        _ensure_unique_label(conn, uid, name, exclude=label_id)
     conn.execute("UPDATE labels SET name = ? WHERE id = ?", (keyring.encrypt(name), label_id))
     conn.commit()
-    hub.publish([user["id"]], {"t": "labels"}, exclude_client=client_of(request))
-    return {"id": label_id, "name": name}
+    hub.publish(audience, {"t": "labels"}, exclude_client=client_of(request))
+    return _label_dict(conn, user["id"], label_id)
 
 
 @app.delete("/api/labels/{label_id}", status_code=204)
 def delete_label(label_id: int, request: Request, user=Depends(current_user), conn=Depends(get_db)):
+    _own_label(conn, user["id"], label_id)   # 403 für Mitglieder, 404 für Fremde
+    audience = _label_audience(conn, label_id)
+    note_ids = [r[0] for r in conn.execute("SELECT note_id FROM note_labels WHERE label_id = ?", (label_id,))]
     conn.execute("DELETE FROM labels WHERE id = ? AND user_id = ?", (label_id, user["id"]))
     conn.commit()
-    hub.publish([user["id"]], {"t": "labels"}, exclude_client=client_of(request))
+    hub.publish(audience, {"t": "labels"}, exclude_client=client_of(request))
+    _refresh_label_notes(conn, note_ids, audience - {user["id"]})
+    return Response(status_code=204)
+
+
+class LabelMemberIn(BaseModel):
+    id: int
+    can_edit: bool = True
+
+
+class LabelMembersIn(BaseModel):
+    members: List[LabelMemberIn] = Field(max_length=200)
+
+
+@app.put("/api/labels/{label_id}/members")
+def set_label_members(label_id: int, body: LabelMembersIn, request: Request, user=Depends(current_user),
+                      conn=Depends(get_db)):
+    """Legt fest, mit wem der Inhaber das Label teilt. Das Teilen gibt keinen Zugriff auf Notizen:
+    Mitglieder sehen das Label nur an Notizen, die sie ohnehin sehen."""
+    uid = user["id"]
+    _own_label(conn, uid, label_id)
+    rights = {m.id: m.can_edit for m in body.members if m.id != uid}
+    wanted = set(rights)
+    current = {r[0] for r in conn.execute("SELECT user_id FROM label_members WHERE label_id = ?", (label_id,))}
+    added, removed = wanted - current, current - wanted
+    if added:
+        marks = ",".join("?" * len(added))
+        found = {r["id"]: r["username"] for r in conn.execute(
+            f"SELECT id, username FROM users WHERE id IN ({marks})", tuple(added))}
+        if set(found) != added:
+            raise HTTPException(400, "Unbekannter Benutzer")
+        name = keyring.decrypt(conn.execute("SELECT name FROM labels WHERE id = ?", (label_id,)).fetchone()[0]).casefold()
+        for other in added:
+            if any(lab["name"].casefold() == name for lab in _label_list(conn, other)):
+                raise HTTPException(409, f"{found[other]} hat bereits ein Label mit diesem Namen.")
+    t = core.now()
+    conn.executemany("INSERT INTO label_members(label_id, user_id, added_at, can_edit) VALUES (?,?,?,?)",
+                     [(label_id, other, t, int(rights[other])) for other in added])
+    conn.executemany("UPDATE label_members SET can_edit = ? WHERE label_id = ? AND user_id = ?",
+                     [(int(rights[other]), label_id, other) for other in wanted & current])
+    conn.executemany("DELETE FROM label_members WHERE label_id = ? AND user_id = ?",
+                     [(label_id, other) for other in removed])
+    conn.commit()
+    note_ids = [r[0] for r in conn.execute("SELECT note_id FROM note_labels WHERE label_id = ?", (label_id,))]
+    audience = _label_audience(conn, label_id) | removed
+    hub.publish(audience, {"t": "labels"}, exclude_client=client_of(request))
+    _refresh_label_notes(conn, note_ids, added | removed)
+    hub.publish(wanted & current, {"t": "labels"}, exclude_client=client_of(request))
+    return _label_dict(conn, uid, label_id)
+
+
+@app.post("/api/labels/{label_id}/leave", status_code=204)
+def leave_label(label_id: int, request: Request, user=Depends(current_user), conn=Depends(get_db)):
+    uid = user["id"]
+    cur = conn.execute("DELETE FROM label_members WHERE label_id = ? AND user_id = ?", (label_id, uid))
+    if not cur.rowcount:
+        raise HTTPException(404, "Label nicht gefunden")
+    conn.commit()
+    note_ids = [r[0] for r in conn.execute("SELECT note_id FROM note_labels WHERE label_id = ?", (label_id,))]
+    hub.publish(_label_audience(conn, label_id) | {uid}, {"t": "labels"}, exclude_client=client_of(request))
+    _refresh_label_notes(conn, note_ids, {uid})
     return Response(status_code=204)
 
 
