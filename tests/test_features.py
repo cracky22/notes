@@ -14,6 +14,9 @@ sys.path.insert(0, str(ROOT))
 _TMP = tempfile.TemporaryDirectory()
 os.environ["NOTIZEN_DATA_DIR"] = _TMP.name
 os.environ.pop("NOTIZEN_DB", None)
+os.environ["NOTIZEN_INDEX_WORKERS"] = "2"      # Prozess-Pool der Indizierung mittesten
+os.environ["NOTIZEN_OCR_WORKERS"] = "2"
+os.environ["NOTIZEN_OCR_PROCESSES"] = "3"
 os.environ.pop("NOTIZEN_KEY_FILE", None)
 os.environ.pop("NOTIZEN_BACKUP_DIR", None)
 
@@ -230,6 +233,25 @@ def test_all():
         assert q["queued"] >= 3
         settle()
         assert c.get("/api/admin/ocr").json()["pending"] == 0
+        # ---- Indizierung auf mehreren Kernen (Prozess-Pool) -------------------
+        _login(c, "anna")
+        words = {}
+        for i in range(40):
+            word = f"zebrawort{i:02d}x"
+            words[word] = _note(c, title=f"Mehrkern {i}", body=[{"insert": f"{word} gemeinsamer Text\n"}])
+        assert c.post(f"/api/admin/users/{uid['anna']}/search-index/reset", headers=CSRF).status_code == 200   # umgeht die Sperrzeit
+        end = time.time() + 90
+        while time.time() < end:
+            st = c.get("/api/me/search-index").json()
+            if st["state"] == "ready" and not st["ocr_pending"]:
+                break
+            time.sleep(0.5)
+        assert st["state"] == "ready", st
+        import search_index as sidx
+        assert sidx.INDEX_WORKERS == 2 and sidx._pool is not None             # Pool wurde tatsächlich benutzt
+        for word, nid_ in words.items():
+            assert c.post("/api/search", json={"q": word}, headers=CSRF).json()["ids"] == [nid_], word
+        assert len(c.post("/api/search", json={"q": "gemeinsamer"}, headers=CSRF).json()["ids"]) == 40
         # Verlässt der Inhaber die gemeinsame Notiz nicht, bleibt alles konsistent: Rotation kennt die neue Tabelle
         conn = core.connect()
         assert core.key_ids_in_db(conn)
