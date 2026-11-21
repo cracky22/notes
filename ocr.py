@@ -10,6 +10,14 @@ Systemvoraussetzung: das Programm `tesseract` (mit Sprachdaten, z. B. `deu` und 
 Python-Pakete: pypdf; zum Rendern pypdfium2 – ersatzweise wird `pdftoppm` (poppler-utils) genutzt.
 Umgebungsvariablen: NOTIZEN_OCR_LANGS (Standard "deu+eng"), NOTIZEN_TESSERACT (Pfad),
 NOTIZEN_OCR_DPI (Standard 300).
+
+Parallelität (Standardwerte richten sich nach der Kernzahl):
+  NOTIZEN_OCR_PROCESSES    gleichzeitige Tesseract-Prozesse insgesamt (Standard: Kernzahl)
+  NOTIZEN_OCR_WORKERS      gleichzeitig bearbeitete Anhänge (Standard: Kernzahl/2, mind. 1; in app.py)
+  NOTIZEN_OCR_PAGE_WORKERS gleichzeitig erkannte Seiten je PDF (Standard: NOTIZEN_OCR_PROCESSES)
+  NOTIZEN_OCR_THREADS      OpenMP-Threads je Tesseract-Prozess (Standard 1)
+  NOTIZEN_INDEX_WORKERS    Prozesse für die Indizierung (Standard: Kernzahl; in search_index.py)
+Tesseract läuft nur auf der CPU (keine GPU-Unterstützung).
 """
 from __future__ import annotations
 
@@ -18,13 +26,19 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MIN_WORD_CONF = 50          # Wörter mit geringerer Erkennungssicherheit werden nicht indexiert
 PAGE_TEXT_MIN_CHARS = 20    # ab so vielen Buchstaben/Ziffern gilt eine PDF-Seite als „hat Text“
 MAX_PIXELS_SIDE = 4500      # längste Kante beim Rendern einer PDF-Seite
 MAX_OCR_CHARS = 400_000
+CPUS = os.cpu_count() or 1
+# Gleichzeitig laufende Tesseract-Prozesse (alle Aufträge zusammen) – jeder Prozess nutzt einen Kern
+OCR_PROCESSES = max(1, int(os.environ.get("NOTIZEN_OCR_PROCESSES", CPUS)))
+_tess_slots = threading.BoundedSemaphore(OCR_PROCESSES)
 TESSERACT_TIMEOUT = 240
 RENDER_TIMEOUT = 120
 DEFAULT_LANGS = "deu+eng"
@@ -93,9 +107,11 @@ def _run_tesseract(args: list[str]) -> subprocess.CompletedProcess:
     exe = tesseract_path()
     if not exe:
         raise OcrUnavailable("Tesseract ist nicht installiert.")
-    env = {**os.environ, "OMP_THREAD_LIMIT": os.environ.get("NOTIZEN_OCR_THREADS", "2")}
+    # ein Thread je Tesseract-Prozess: die Auslastung kommt durch mehrere Prozesse parallel (effizienter als OpenMP)
+    env = {**os.environ, "OMP_THREAD_LIMIT": os.environ.get("NOTIZEN_OCR_THREADS", "1")}
     try:
-        proc = subprocess.run([exe, *args], capture_output=True, timeout=TESSERACT_TIMEOUT, env=env)
+        with _tess_slots:
+            proc = subprocess.run([exe, *args], capture_output=True, timeout=TESSERACT_TIMEOUT, env=env)
     except subprocess.TimeoutExpired as exc:
         raise OcrError("Die Texterkennung hat zu lange gedauert.") from exc
     except OSError as exc:
@@ -241,54 +257,84 @@ def check_pdf(data: bytes) -> int:
 
 
 def ocr_pdf(data: bytes, should_stop=lambda: False) -> tuple[bytes, str, int, int]:
-    """Gibt (neue PDF-Daten, Volltext, Seitenzahl, Anzahl erkannter Scan-Seiten) zurück."""
+    """Gibt (neue PDF-Daten, Volltext, Seitenzahl, Anzahl erkannter Scan-Seiten) zurück.
+
+    Scan-Seiten werden parallel erkannt (Rendern nacheinander, Tesseract in mehreren Prozessen)."""
     from pypdf import PdfReader, PdfWriter
     pages_total = check_pdf(data)
     reader = PdfReader(io.BytesIO(data))
-    writer = PdfWriter()
-    texts: list[str] = []
-    scanned = 0
     langs = languages()
+    base_dpi = float(os.environ.get("NOTIZEN_OCR_DPI", "300"))
+    keep: dict[int, tuple] = {}          # Seite mit vorhandenem Text: (page, text)
+    scans: list[tuple[int, float]] = []   # Scan-Seiten: (Index, dpi)
+    for i, page in enumerate(reader.pages):
+        if should_stop():
+            raise OcrAborted()
+        try:
+            existing = (page.extract_text() or "").strip()
+        except Exception:  # noqa: BLE001
+            existing = ""
+        if _alnum_count(existing) >= PAGE_TEXT_MIN_CHARS:
+            keep[i] = (page, existing)       # Seite hat bereits Text: unverändert übernehmen
+            continue
+        try:
+            longest_in = max(float(page.mediabox.width), float(page.mediabox.height)) / 72
+        except Exception:  # noqa: BLE001
+            longest_in = 11.7
+        dpi = base_dpi
+        if longest_in > 0:
+            dpi = max(50.0, min(dpi, MAX_PIXELS_SIDE / longest_in))
+        scans.append((i, dpi))
+
+    done: dict[int, tuple[bytes, str]] = {}
     with tempfile.TemporaryDirectory(prefix="notizen-ocr-") as tmpdir:
         tmp = Path(tmpdir)
-        renderer = None
+        renderer = _Renderer(data, tmp) if scans else None
+
+        def scan(i: int, dpi: float) -> tuple[int, bytes, str]:
+            if should_stop():
+                raise OcrAborted()
+            im = renderer.render(i, dpi)
+            src, base = tmp / f"p{i}.jpg", tmp / f"p{i}"
+            im.save(src, "JPEG", quality=82, dpi=(round(dpi), round(dpi)))
+            _run_tesseract([str(src), str(base), "-l", langs, "pdf", "tsv"])
+            try:
+                pdf_bytes = (tmp / f"p{i}.pdf").read_bytes()
+                text = text_from_tsv((tmp / f"p{i}.tsv").read_text("utf-8", "replace"))
+                PdfReader(io.BytesIO(pdf_bytes)).pages[0]   # Ergebnis prüfen
+            except Exception as exc:  # noqa: BLE001
+                raise OcrError(f"Seite {i + 1}: Ergebnis der Texterkennung unbrauchbar.") from exc
+            for f in (src, tmp / f"p{i}.pdf", tmp / f"p{i}.tsv"):
+                f.unlink(missing_ok=True)
+            return i, pdf_bytes, text
+
         try:
-            for i, page in enumerate(reader.pages):
-                if should_stop():
-                    raise OcrAborted()
-                try:
-                    existing = (page.extract_text() or "").strip()
-                except Exception:  # noqa: BLE001
-                    existing = ""
-                if _alnum_count(existing) >= PAGE_TEXT_MIN_CHARS:
-                    writer.add_page(page)          # Seite hat bereits Text: unverändert übernehmen
-                    texts.append(existing)
-                    continue
-                if renderer is None:
-                    renderer = _Renderer(data, tmp)
-                try:
-                    longest_in = max(float(page.mediabox.width), float(page.mediabox.height)) / 72
-                except Exception:  # noqa: BLE001
-                    longest_in = 11.7
-                dpi = float(os.environ.get("NOTIZEN_OCR_DPI", "300"))
-                if longest_in > 0:
-                    dpi = max(50.0, min(dpi, MAX_PIXELS_SIDE / longest_in))
-                im = renderer.render(i, dpi)
-                src, base = tmp / f"p{i}.jpg", tmp / f"p{i}"
-                im.save(src, "JPEG", quality=82, dpi=(round(dpi), round(dpi)))
-                _run_tesseract([str(src), str(base), "-l", langs, "pdf", "tsv"])
-                try:
-                    one = PdfReader(io.BytesIO((tmp / f"p{i}.pdf").read_bytes()))
-                    writer.add_page(one.pages[0])
-                    texts.append(text_from_tsv((tmp / f"p{i}.tsv").read_text("utf-8", "replace")))
-                except Exception as exc:  # noqa: BLE001
-                    raise OcrError(f"Seite {i + 1}: Ergebnis der Texterkennung unbrauchbar.") from exc
-                scanned += 1
-                for f in (src, tmp / f"p{i}.pdf", tmp / f"p{i}.tsv"):
-                    f.unlink(missing_ok=True)
+            if scans:
+                workers = max(1, min(len(scans), int(os.environ.get("NOTIZEN_OCR_PAGE_WORKERS", OCR_PROCESSES))))
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ocr-page") as pool:
+                    futures = [pool.submit(scan, i, dpi) for i, dpi in scans]
+                    try:
+                        for fut in futures:
+                            i, pdf_bytes, text = fut.result()
+                            done[i] = (pdf_bytes, text)
+                    except BaseException:
+                        for fut in futures:
+                            fut.cancel()
+                        raise
         finally:
             if renderer is not None:
                 renderer.close()
+
+        writer = PdfWriter()
+        texts: list[str] = []
+        for i in range(len(reader.pages)):
+            if i in keep:
+                writer.add_page(keep[i][0])
+                texts.append(keep[i][1])
+            else:
+                pdf_bytes, text = done[i]
+                writer.add_page(PdfReader(io.BytesIO(pdf_bytes)).pages[0])
+                texts.append(text)
         out = io.BytesIO()
         writer.write(out)
-    return out.getvalue(), "\n\n".join(t for t in texts if t)[:MAX_OCR_CHARS], pages_total, scanned
+    return out.getvalue(), "\n\n".join(t for t in texts if t)[:MAX_OCR_CHARS], pages_total, len(scans)

@@ -244,6 +244,11 @@ async def index_worker() -> None:
 # --------------------------------------------------------------------------- #
 _ocr_wakeup: asyncio.Event | None = None
 _ocr_stop = threading.Event()
+# Anzahl gleichzeitig bearbeiteter Anhänge (Standard: halbe Kernzahl, mind. 1); die Gesamtzahl gleichzeitiger
+# Tesseract-Prozesse begrenzt NOTIZEN_OCR_PROCESSES (Standard: Kernzahl)
+OCR_WORKERS = max(1, int(os.environ.get("NOTIZEN_OCR_WORKERS", max(1, (os.cpu_count() or 1) // 2))))
+_ocr_inflight: set[int] = set()
+_ocr_inflight_lock = threading.Lock()
 
 
 def wake_ocr() -> None:
@@ -304,9 +309,15 @@ def run_ocr_job() -> str:
     if not ocr.available():
         return "unavailable"
     conn = core.connect()
+    job = None
     try:
-        job = conn.execute("SELECT id, note_id, kind, owner_id, size, key_id, data FROM blobs "
-                           "WHERE ocr_state='pending' AND kind IN ('image','pdf') ORDER BY id LIMIT 1").fetchone()
+        with _ocr_inflight_lock:   # Auftrag exklusiv für diesen Worker vormerken
+            taken = tuple(_ocr_inflight)
+            job = conn.execute("SELECT id, note_id, kind, owner_id, size, key_id, data FROM blobs "
+                               "WHERE ocr_state='pending' AND kind IN ('image','pdf') "
+                               f"AND id NOT IN ({','.join('?' * len(taken))}) ORDER BY id LIMIT 1", taken).fetchone()
+            if job:
+                _ocr_inflight.add(job["id"])
         if not job:
             return "idle"
         try:
@@ -332,15 +343,24 @@ def run_ocr_job() -> str:
         conn.rollback()
         raise
     finally:
+        if job is not None:
+            with _ocr_inflight_lock:
+                _ocr_inflight.discard(job["id"])
         conn.close()
 
 
 async def ocr_worker() -> None:
+    """Startet OCR_WORKERS parallele Worker (jeder bearbeitet einen Anhang, PDFs zusätzlich seitenweise parallel)."""
     global _ocr_wakeup
     _ocr_wakeup = asyncio.Event()
+    await asyncio.gather(*(_ocr_worker_loop() for _ in range(OCR_WORKERS)))
+
+
+async def _ocr_worker_loop() -> None:
     warned = False
     while not _ocr_stop.is_set():
         wait = 15.0
+        _ocr_wakeup.clear()   # vor der Arbeit löschen: ein Weckruf währenddessen geht nicht verloren
         try:
             status = await run_in_threadpool(run_ocr_job)
             if status == "worked":
@@ -355,7 +375,6 @@ async def ocr_worker() -> None:
             raise
         except Exception:  # noqa: BLE001
             log.exception("OCR-Worker")
-        _ocr_wakeup.clear()
         try:
             await asyncio.wait_for(_ocr_wakeup.wait(), timeout=wait)
         except asyncio.TimeoutError:
@@ -376,6 +395,7 @@ async def lifespan(_app: FastAPI):
     finally:
         _index_stop.set()
         _ocr_stop.set()
+        sidx.shutdown_pool()
         for task in (compressor, indexer, ocr_task):
             task.cancel()
             try:

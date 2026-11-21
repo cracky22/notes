@@ -12,8 +12,10 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
+import threading
 import time
 
 import core
@@ -217,28 +219,114 @@ _UPSERT = ("INSERT INTO search_entries(user_id,note_id,rev,generation,payload) V
            "OR excluded.generation>search_entries.generation")
 
 
-def _index_note(conn, keyring, note_id: int, only_user: int | None = None) -> int:
+# --------------------------------------------------------------------------- #
+# Berechnung auf mehreren Kernen: Tokenisieren, Verschlüsseln und Hashen läuft (ab PARALLEL_MIN Notizen)
+# in einem Prozess-Pool; gelesen und geschrieben wird in der Datenbank nacheinander.
+# --------------------------------------------------------------------------- #
+INDEX_WORKERS = max(1, int(os.environ.get("NOTIZEN_INDEX_WORKERS", os.cpu_count() or 1)))
+PARALLEL_MIN = 16
+_pool = None
+_pool_lock = threading.Lock()
+_worker_keyring = None
+
+
+def _worker_init(key_path: str) -> None:
+    global _worker_keyring
+    from pathlib import Path
+    _worker_keyring = core.KeyRing(Path(key_path))
+
+
+def _compute_in_worker(job: dict) -> dict:
+    return _compute(_worker_keyring, job)
+
+
+def _get_pool():
+    global _pool
+    with _pool_lock:
+        if _pool is None:
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+            _pool = ProcessPoolExecutor(max_workers=INDEX_WORKERS, mp_context=multiprocessing.get_context("spawn"),
+                                        initializer=_worker_init, initargs=(str(core.KEY_PATH),))
+        return _pool
+
+
+def shutdown_pool() -> None:
+    global _pool
+    with _pool_lock:
+        pool, _pool = _pool, None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _prepare_note(conn, keyring, note_id: int, only_user: int | None = None) -> dict | None:
+    """Lesephase: sammelt alles, was für die Berechnung nötig ist (None: nichts zu indizieren)."""
     note = conn.execute("SELECT payload, rev FROM notes WHERE id=?", (note_id,)).fetchone()
     if not note:
-        return 0
+        return None
     members = conn.execute(
         "SELECT nu.user_id, COALESCE(s.generation,0), s.token_key_enc FROM note_users nu "
         "LEFT JOIN search_index s ON s.user_id=nu.user_id WHERE nu.note_id=?"
         + (" AND nu.user_id=?" if only_user is not None else ""),
         (note_id, only_user) if only_user is not None else (note_id,)).fetchall()
-    members = [r for r in members if r[2]]
+    members = [(r[0], r[1], r[2]) for r in members if r[2]]
     if not members:
-        return 0
-    tokens = doc_tokens(_load_note_doc(keyring, note["payload"]), attachment_text(conn, keyring, note_id))
-    entry = _entry_payload(keyring, tokens)
-    for uid, gen, enc_key in members:
+        return None
+    return {"note_id": note_id, "rev": note["rev"], "payload": note["payload"],
+            "attachments": attachment_text(conn, keyring, note_id), "members": members}
+
+
+def _compute(keyring, job: dict) -> dict:
+    """Rechenphase (ohne Datenbankzugriff, deshalb auch in Worker-Prozessen möglich)."""
+    tokens = doc_tokens(_load_note_doc(keyring, job["payload"]), job["attachments"])
+    grams = {gram for token in tokens for gram in _grams(token)}
+    per_user = []
+    for uid, gen, enc_key in job["members"]:
         user_key = _decode_user_key(keyring, enc_key)
-        conn.execute(_UPSERT, (uid, note_id, note["rev"], gen, entry))
-        conn.execute("DELETE FROM search_terms WHERE user_id=? AND note_id=?", (uid, note_id))
-        hashes = {_term_hash(user_key, gram) for token in tokens for gram in _grams(token)}
+        per_user.append((uid, gen, [_term_hash(user_key, gram) for gram in grams]))
+    return {"entry": _entry_payload(keyring, tokens), "per_user": per_user}
+
+
+def _write_note(conn, job: dict, result: dict) -> int:
+    nid = job["note_id"]
+    for uid, gen, hashes in result["per_user"]:
+        conn.execute(_UPSERT, (uid, nid, job["rev"], gen, result["entry"]))
+        conn.execute("DELETE FROM search_terms WHERE user_id=? AND note_id=?", (uid, nid))
         conn.executemany("INSERT INTO search_terms(user_id,token_hash,note_id) VALUES (?,?,?)",
-                         [(uid, digest, note_id) for digest in hashes])
-    return len(members)
+                         [(uid, digest, nid) for digest in set(hashes)])
+    return len(result["per_user"])
+
+
+def compute_many(keyring, jobs: list[dict]) -> list:
+    """Berechnet viele Notizen, bei genügend Arbeit parallel auf mehreren Kernen.
+    Je Notiz kommt das Ergebnis oder die aufgetretene Exception zurück."""
+    if INDEX_WORKERS > 1 and len(jobs) >= PARALLEL_MIN:
+        try:
+            pool = _get_pool()
+            futures = [pool.submit(_compute_in_worker, j) for j in jobs]
+            out = []
+            for f in futures:
+                try:
+                    out.append(f.result())
+                except Exception as exc:  # noqa: BLE001
+                    out.append(exc)
+            return out
+        except Exception:  # noqa: BLE001  (Pool defekt, z. B. Worker abgestürzt: einmal sequenziell weiterarbeiten)
+            shutdown_pool()
+    out = []
+    for j in jobs:
+        try:
+            out.append(_compute(keyring, j))
+        except Exception as exc:  # noqa: BLE001
+            out.append(exc)
+    return out
+
+
+def _index_note(conn, keyring, note_id: int, only_user: int | None = None) -> int:
+    job = _prepare_note(conn, keyring, note_id, only_user)
+    if job is None:
+        return 0
+    return _write_note(conn, job, _compute(keyring, job))
 
 
 def process_dirty(keyring, limit: int = DIRTY_BATCH) -> int:
@@ -250,11 +338,18 @@ def process_dirty(keyring, limit: int = DIRTY_BATCH) -> int:
         ensure_rows(conn, keyring)
         rows = conn.execute("SELECT note_id, marked_at FROM search_dirty ORDER BY marked_at LIMIT ?",
                             (limit,)).fetchall()
+        jobs = {r["note_id"]: _prepare_note(conn, keyring, r["note_id"]) for r in rows}
+        todo = [j for j in jobs.values() if j is not None]
+        results = dict(zip((j["note_id"] for j in todo), compute_many(keyring, todo)))
         for r in rows:
             nid = r["note_id"]
             conn.execute("SAVEPOINT dirty_note")
             try:
-                _index_note(conn, keyring, nid)
+                res = results.get(nid)
+                if isinstance(res, Exception):
+                    raise res
+                if res is not None:
+                    _write_note(conn, jobs[nid], res)
                 conn.execute("RELEASE dirty_note")
             except Exception as exc:  # noqa: BLE001
                 conn.execute("ROLLBACK TO dirty_note")
@@ -313,8 +408,11 @@ def build_user(keyring, user_id: int, should_stop=lambda: False, pause: float = 
                              "WHERE user_id=? AND generation=?", (INDEX_VERSION, core.now(), done, done, user_id, gen))
                 conn.commit()
                 return "ready"
-            for nid in ids:
-                _index_note(conn, keyring, nid, only_user=user_id)
+            jobs = [j for j in (_prepare_note(conn, keyring, nid, user_id) for nid in ids) if j is not None]
+            for job, res in zip(jobs, compute_many(keyring, jobs)):
+                if isinstance(res, Exception):
+                    raise res
+                _write_note(conn, job, res)
             done += len(ids)
             cursor = ids[-1]
             conn.execute("UPDATE search_index SET done=? WHERE user_id=? AND generation=?", (done, user_id, gen))
