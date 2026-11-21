@@ -62,6 +62,9 @@ export const ICONS = {
   work: 'M20 6h-4V4c0-1.11-.89-2-2-2h-4c-1.11 0-2 .89-2 2v2H4c-1.11 0-1.99.89-1.99 2L2 19c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V8c0-1.11-.89-2-2-2zm-6 0h-4V4h4v2z',
   tv: 'M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 1.99-.9 1.99-2L23 5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z',
   sport: 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 3.3 1.35-.95c1.82.56 3.37 1.76 4.38 3.34l-.39 1.34-1.35.46L13 6.7V5.3zm-3.35-.95L11 5.3v1.4L7.01 9.49l-1.35-.46-.39-1.34a8.103 8.103 0 0 1 4.38-3.34zM7.08 17.11l-1.14.1A7.938 7.938 0 0 1 4 12c0-.12.01-.23.02-.35l1-.73 1.38.48 1.46 4.34-.78 1.37zm7.42 2.48c-.79.26-1.63.41-2.5.41s-1.71-.15-2.5-.41l-.69-1.49.64-1.1h5.11l.64 1.11-.7 1.48zM14.27 15H9.73l-1.35-4.02L12 8.44l3.63 2.54L14.27 15zm3.79 2.21-1.14-.1-.79-1.37 1.46-4.34 1.39-.47 1 .73c.01.11.02.22.02.34 0 1.99-.73 3.81-1.94 5.21z',
+  zoom_in: 'M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14zm2.5-4h-2v2H9v-2H7V9h2V7h1v2h2v1z',
+  download: 'M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z',
+  open_in_new: 'M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z',
   zoom_out: 'M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14zM7 9h5v1H7z',
 };
 
@@ -107,6 +110,9 @@ export function iconBtn(name, title, onclick, cls = '', size = 24) {
 
 export function setIcon(el, name, size = 24) { el.replaceChildren(icon(name, size)); }
 
+/** Bildadresse: lokale Vorschau (Upload läuft) · Miniatur (Karten, Editor) · Original (Großansicht). */
+export const imageSrc = (img, { full = false } = {}) => img.url || (full ? `api/images/${img.id}` : `api/images/${img.id}/thumb`);
+
 export const isPdfFile = f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name || '');
 export const isAttachable = f => f.type.startsWith('image/') || isPdfFile(f);
 
@@ -115,8 +121,9 @@ function fmtSize(bytes) {
   return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1).replace('.', ',')} MB`;
 }
 
-/** Liste der PDF-Anhänge einer Notiz (Karte: nur Öffnen, Editor: zusätzlich Entfernen). */
-export function pdfList(pdfs, { cls = '', onRemove = null } = {}) {
+/** Liste der PDF-Anhänge einer Notiz (Karte: nur Öffnen, Editor: zusätzlich Entfernen).
+ *  onOpen(pdf) zeigt die In-App-Vorschau; ohne onOpen öffnet die Datei in einem neuen Tab. */
+export function pdfList(pdfs, { cls = '', onRemove = null, onOpen = null } = {}) {
   const wrap = h('div', { class: `pdf-list ${cls}`.trim() });
   for (const p of pdfs) {
     const status = p.uploading ? 'Wird hochgeladen …'
@@ -124,10 +131,21 @@ export function pdfList(pdfs, { cls = '', onRemove = null } = {}) {
         : p.ocr === 'failed' ? 'Texterkennung fehlgeschlagen'
           : p.ocr === 'done' ? 'durchsuchbar' : '';
     const meta = [p.pages ? `${p.pages} ${p.pages === 1 ? 'Seite' : 'Seiten'}` : '', fmtSize(p.size), status].filter(Boolean).join(' · ');
-    const open = () => { if (!p.uploading && p.id) window.open(`api/pdfs/${p.id}`, '_blank', 'noopener'); };
+    const open = () => {
+      if (p.uploading || !p.id) return;
+      if (onOpen) onOpen(p); else window.open(`api/pdfs/${p.id}`, '_blank', 'noopener');
+    };
+    // Erste Seite als kleine Vorschau; solange sie lädt (oder bei Fehler) bleibt das PDF-Symbol sichtbar
+    const lead = h('span', { class: 'pdf-lead' }, icon('picture_as_pdf', 22));
+    if (p.id && !p.uploading) {
+      const thumb = h('img', { class: 'pdf-thumb', src: `api/pdfs/${p.id}/thumb`, alt: '', loading: 'lazy', draggable: 'false' });
+      thumb.addEventListener('load', () => lead.classList.add('has-thumb'));
+      thumb.addEventListener('error', () => thumb.remove());
+      lead.append(thumb);
+    }
     const row = h('div', { class: 'pdf-item' + (p.uploading || p.ocr === 'pending' ? ' busy' : '') + (p.ocr === 'failed' ? ' failed' : '') },
       h('button', { type: 'button', class: 'pdf-open', title: `${p.name} öffnen`, onclick: e => { e.stopPropagation(); open(); } },
-        icon('picture_as_pdf', 22),
+        lead,
         h('span', { class: 'pdf-text' }, h('span', { class: 'pdf-name', text: p.name }), h('span', { class: 'pdf-meta', text: meta }))));
     if (onRemove && !p.uploading) row.append(iconBtn('delete', 'PDF entfernen', e => { e.stopPropagation(); onRemove(p); }, 'pdf-del', 20));
     wrap.append(row);
@@ -256,6 +274,7 @@ export function openModal(content, { onClose, className = '', from = null, label
   backdrop.addEventListener('mousedown', e => { if (e.target === backdrop) entry.close(); });
   document.getElementById('modal-root').append(backdrop);
   modals.push(entry);
+  entry.scrollY = window.scrollY;   // Seitenposition merken (overflow:hidden kann sie auf Mobilgeräten verschieben)
   document.body.classList.add('modal-open');
   entry.prevFocus = prevFocus;
   // Öffnen: aus der Kartenposition heraus aufziehen (wie im Original), sonst leicht skalieren
@@ -281,7 +300,10 @@ export function closeModal(entry, to = null) {
   const i = modals.indexOf(entry);
   if (i >= 0) modals.splice(i, 1);
   closePopover();
-  if (!modals.length) document.body.classList.remove('modal-open');
+  if (!modals.length) {
+    document.body.classList.remove('modal-open');
+    if (entry.scrollY != null && Math.abs(window.scrollY - entry.scrollY) > 1) window.scrollTo(0, entry.scrollY);
+  }
   if (entry.onClose) entry.onClose();
   const done = () => entry.backdrop.remove();
   if (reducedMotion()) { done(); return; }

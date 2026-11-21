@@ -2,7 +2,7 @@
 import { Delta, invertChange, composeChanges, xform, transformIndex, sortItems } from './delta.js';
 import { TextField } from './editor.js';
 import { rid } from './sync.js';
-import { h, icon, iconBtn, pdfList, isAttachable, setIcon, avatar, userColor, openPopover, closePopover, menu, captureLayout, playLayout, throttle, fmtDate, fmtDateLong, plural } from './dom.js';
+import { h, icon, iconBtn, pdfList, imageSrc, isAttachable, setIcon, avatar, userColor, openPopover, closePopover, menu, captureLayout, playLayout, throttle, fmtDate, fmtDateLong, plural } from './dom.js';
 import { state, app, setting, hintFor } from './state.js';
 
 // Positionen erhalten einen kleinen Zufallsversatz, damit gleichzeitig angelegte Elemente
@@ -781,7 +781,7 @@ export class NoteEditor {
     if (!imgs.length) return;
     this.imagesEl.dataset.count = String(Math.min(imgs.length, 6));
     imgs.forEach((img, idx) => {
-      const src = img.url || `api/images/${img.id}`;
+      const src = imageSrc(img);   // Miniatur; das Original lädt erst die Großansicht
       const ratio = img.w && img.h ? img.w / img.h : 1.5;
       const tile = h('div', { class: 'ed-img' + (img.uploading ? ' uploading' : ''), style: { aspectRatio: imgs.length === 1 ? String(ratio) : '' } },
         h('img', { src, alt: '', loading: 'lazy', draggable: 'false', onclick: () => this.actions.viewImage && this.actions.viewImage(idx) }));
@@ -798,7 +798,10 @@ export class NoteEditor {
     this.pdfsEl.replaceChildren();
     this.pdfsEl.classList.toggle('hidden', !pdfs.length);
     if (!pdfs.length) return;
-    this.pdfsEl.append(pdfList(pdfs, { onRemove: this.readOnly || !this.actions.removePdf ? null : p => this.actions.removePdf(p) }));
+    this.pdfsEl.append(pdfList(pdfs, {
+      onRemove: this.readOnly || !this.actions.removePdf ? null : p => this.actions.removePdf(p),
+      onOpen: this.actions.viewPdf ? p => this.actions.viewPdf(p) : null,
+    }));
   }
 
   addImages(files) {

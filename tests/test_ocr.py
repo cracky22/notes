@@ -70,7 +70,7 @@ def test_migration_v6_to_v7():
             kp = Path(tmp) / "k.key"
             core.save_keyfile(kp, {"version": 1, "active": kid, "keys": {kid: entry}})
             core.prepare_db(conn, core.KeyRing(kp))
-            assert core.schema_version(conn) == 7
+            assert core.schema_version(conn) == core.SCHEMA_VERSION
             rows = {r["kind"]: r["ocr_state"] for r in conn.execute("SELECT kind, ocr_state FROM blobs")}
             assert rows == {"image": "pending", "avatar": "none"}
             conn.execute("INSERT INTO blobs(kind,mime,width,height,size,key_id,data,created_at,ocr_state) "

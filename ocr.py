@@ -168,8 +168,10 @@ class _Renderer:
         self._doc = None
         self._tmp = tmp
         try:
+            import core
             import pypdfium2 as pdfium
-            self._doc = pdfium.PdfDocument(data)
+            with core.PDFIUM_LOCK:
+                self._doc = pdfium.PdfDocument(data)
         except ImportError:
             exe = shutil.which("pdftoppm")
             if not exe:
@@ -184,8 +186,10 @@ class _Renderer:
         from PIL import Image
         if self._doc is not None:
             try:
-                bitmap = self._doc[index].render(scale=dpi / 72)
-                return bitmap.to_pil().convert("RGB")
+                import core
+                with core.PDFIUM_LOCK:
+                    bitmap = self._doc[index].render(scale=dpi / 72)
+                    return bitmap.to_pil().convert("RGB")
             except Exception as exc:  # noqa: BLE001
                 raise OcrError(f"Seite {index + 1} kann nicht gerendert werden.") from exc
         base = self._tmp / f"page{index}"
@@ -201,7 +205,9 @@ class _Renderer:
     def close(self) -> None:
         if self._doc is not None:
             try:
-                self._doc.close()
+                import core
+                with core.PDFIUM_LOCK:
+                    self._doc.close()
             except Exception:  # noqa: BLE001
                 pass
 
