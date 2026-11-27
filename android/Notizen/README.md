@@ -1,32 +1,29 @@
-# Notizen Android
+# Notizen für Android
 
-Native Android client in Kotlin + Jetpack Compose for the supplied FastAPI Notizen backend.
+Native Android-App für den mitgelieferten FastAPI-Notizenserver. Die Oberfläche orientiert sich an Google Keep, bleibt aber eine eigenständige Client-App für diesen Server.
 
-## Included
+## Funktionen
 
-- Login via `POST /api/login`; the backend's `notizen_session` cookie is persisted encrypted.
-- Notes pagination, note creation/editing, checklist items, full-text search, pin/archive/trash/restore/delete actions.
-- Text edits use the backend's WebSocket Operational Transformation endpoint (`/ws`) rather than writing note payloads directly.
-- Local read cache in Room; each cached note payload is encrypted with an AES-GCM key held by Android Keystore.
-- The account's `cache_generation` is checked after authentication. If the server/admin increments it, this app clears that user's local note cache, matching the backend reset mechanism.
-- Haptic taps and motion transitions on navigation, note cards, checklists, and QR confirmation.
-- Camera permission is requested only when the signed-in user starts scanning; QR frames are processed on-device and not stored. The ML Kit QR scanner reads the browser login URL and asks for an explicit in-app confirmation before calling `POST /api/device-login/approve`.
-- Server base URLs may include a reverse-proxy prefix, for example `https://notes.example.org/notizen/`.
+- Keep-inspiriertes Layout mit Original-Notizfarben, Light-, Dark- und System-Theme, Raster- und Listenansicht.
+- Schneller Start: zuerst werden verschlüsselte Room-Cachedaten angezeigt; der System-Splash weicht ohne dauerhaften Ladebildschirm der App. Synchronisation läuft anschließend im Hintergrund.
+- Anmeldung mit Benutzername/Passwort oder Magic Link, QR-Scanner für Magic Links und Freigabe einer Browser-Geräteanmeldung.
+- Notizen und Checklisten mit Titel, formatierbarem Rich Text (fett, kursiv, unterstrichen, H1/H2), Undo/Redo, Sortierung von Listeneinträgen und automatischem Speichern über das serverseitige OT-WebSocket-Protokoll.
+- Bilder und PDFs aus dem System-Dateiauswahldialog anhängen, Bilder ansehen und PDFs herunterladen/öffnen/entfernen. Text, Bilder und PDFs können außerdem über Androids Teilen-Menü als neue Notiz übernommen werden.
+- Suche, Filter nach Typ/Label/Anhang/Farbe, Labels, Farben, Mehrfachauswahl, Anheften, Archiv, Papierkorb, Wiederherstellen, Kopieren und endgültiges Löschen.
+- Zusammenarbeit an Notizen, Versionsverlauf, Sitzungsverwaltung, Magic-Links, Passwort- und Profilbildänderung, Cache- und Speicherfunktionen.
+- Lokale Notizdaten werden mit AES-GCM verschlüsselt; der Datenschlüssel ist durch Android Keystore geschützt. Bilder werden mit authentifiziertem HTTP-Client geladen.
 
-## Build and run
+## Bauen
 
-1. Use JDK 17, Android SDK 35, and Gradle 8.9 or newer. Android Gradle Plugin 8.7.3 is pinned in the project.
-2. If your Android Studio requires a wrapper, run `gradle wrapper --gradle-version 8.9` once from the project root, then open the folder in Android Studio.
-3. Let Gradle resolve the pinned dependencies, then run the `app` configuration on an emulator or device.
-4. The debug build starts with `http://10.0.2.2:8000/` for a backend running on the development computer. For a device on a LAN, enter the server's reachable IP and port in the login screen.
-5. For production, use HTTPS. The release manifest disallows cleartext HTTP; only the debug variant permits it for local development.
+1. JDK 17, Android SDK 35 und Android Studio mit Android Gradle Plugin 8.7.3 verwenden.
+2. Das Projekt verwendet Gradle 8.9. Gradle und Android-Abhängigkeiten müssen beim ersten Build verfügbar sein.
+3. Projektordner in Android Studio öffnen, Abhängigkeiten synchronisieren und die `app`-Konfiguration starten.
+4. Für den Emulator wird im Debug-Build `http://10.0.2.2:8000/` als Serveradresse verwendet. Auf einem Gerät die LAN-Adresse des Servers eintragen. Für den produktiven Einsatz HTTPS verwenden.
 
-The backend must be reachable at the entered base URL, with `/api/` and `/ws` available under the same path prefix. Create users with the backend's admin CLI before signing in.
+Die Android-App erwartet `/api/` und `/ws` unter derselben Basis-URL bzw. demselben Reverse-Proxy-Pfad. Benutzer werden über die Admin-Funktionen des Notizenservers angelegt.
 
-## Mobile scope and limitations
+## Hinweise
 
-This is a native companion, not a full port of every web feature. It supports plain text and checklist editing, but does not currently edit rich-text formatting, images, labels, collaborators, versions, or profile settings. Offline mode is cached, read-only access; new edits require a live server connection. QR approval requires an already signed-in app session; the user must explicitly confirm each browser login. Formatting is preserved if untouched, but changing the body in this simple editor replaces that body with plain text. As with any cross-device note app, avoid storing patient-identifiable or other sensitive data unless the deployment and device are approved for it.
+Die App ist ein nativer Client, keine offizielle Google-Keep-App. Die UI deckt die mobilen Schreib-, Such-, Organisations- und Kontofunktionen des mitgelieferten Servers ab. Einige browser-/admin-spezifische Verwaltungsabläufe bleiben auf der Weboberfläche des Servers.
 
-## Backend compatibility
-
-The client sends `X-Requested-With: notizen` on mutating REST requests, uses the backend's cookie authentication, and writes document changes through the server's `{t: "op", id, rev, cid, change}` protocol. It does not modify the backend or database schema.
+Ein echter Gradle/Kotlin-Build konnte in der Arbeitsumgebung nicht ausgeführt werden, da weder JDK noch Android SDK installiert waren. Der Quellstand wurde deshalb statisch geprüft; bitte beim ersten Öffnen in Android Studio kompilieren.

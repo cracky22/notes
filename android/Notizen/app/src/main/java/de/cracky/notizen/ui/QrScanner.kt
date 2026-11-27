@@ -1,5 +1,9 @@
 package de.cracky.notizen.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -66,13 +70,21 @@ fun QrScannerDialog(
     onDismiss: () -> Unit,
     onScanned: (String) -> Unit
 ) {
+    val context = LocalContext.current
+    var hasCameraPermission by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+    }
     var cameraError by remember { mutableStateOf<String?>(null) }
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        hasCameraPermission = granted
+        if (!granted) cameraError = "Ohne Kamerazugriff kann kein QR-Code gescannt werden."
+    }
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF101820)) {
-            Column(Modifier.fillMaxSize()) {
+            Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 8.dp, top = 14.dp, bottom = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -83,9 +95,18 @@ fun QrScannerDialog(
                     }
                     IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, "Schliessen", tint = Color.White) }
                 }
-                Box(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp)) {
-                    CameraPreview(onScanned = onScanned, onError = { cameraError = it })
-                    ScannerTarget(Modifier.align(Alignment.Center))
+                Box(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
+                    if (hasCameraPermission) {
+                        CameraPreview(onScanned = onScanned, onError = { cameraError = it })
+                        ScannerTarget(Modifier.align(Alignment.Center))
+                    } else {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(28.dp)) {
+                            Icon(Icons.Default.CameraAlt, null, tint = Color.White, modifier = Modifier.size(42.dp))
+                            Text("Kamerazugriff für QR-Scan", color = Color.White, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 12.dp))
+                            Text("Die Kamera wird nur zum Erkennen des QR-Codes verwendet.", color = Color(0xFFB8C8D4), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical = 10.dp))
+                            Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) { Text("Kamerazugriff erlauben") }
+                        }
+                    }
                 }
                 AnimatedVisibility(
                     visible = cameraError != null,
