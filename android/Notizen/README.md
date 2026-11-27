@@ -13,6 +13,13 @@ Native Android-App für den mitgelieferten FastAPI-Notizenserver. Die Oberfläch
 - Zusammenarbeit an Notizen, Versionsverlauf, Sitzungsverwaltung, Magic-Links, Passwort- und Profilbildänderung, Cache- und Speicherfunktionen.
 - Lokale Notizdaten werden mit AES-GCM verschlüsselt; der Datenschlüssel ist durch Android Keystore geschützt. Bilder werden mit authentifiziertem HTTP-Client geladen.
 
+## Neu in 2.1.0
+
+- Flüssige Animationen: Editor öffnet/schließt als Overlay mit Slide+Scale, Predictive-Back-Geste im Editor, animierte Listen (Einfügen/Verschieben/Entfernen), Ansichtswechsel per Crossfade, animierte Auswahl, FAB-Menü, Suchleiste.
+- Pull-to-Refresh (nach unten ziehen) in allen Ansichten.
+- Die Android-Zurück-Geste schließt die App nicht mehr: sie schließt zuerst Editor/Suche/Auswahl/Menü, dann geht sie aus Archiv/Papierkorb/Label zurück zu „Notizen“; auf der Startansicht passiert nichts.
+- App-Icon: `python tools/make_icon.py pfad/zu/static/logo.svg --bg "#FFFFFF"` (benötigt `pip install cairosvg pillow`) erzeugt alle Icon-Größen und stellt den Splash um.
+
 ## Bauen
 
 1. JDK 17, Android SDK 35 und Android Studio mit Android Gradle Plugin 8.7.3 verwenden.
