@@ -3,6 +3,9 @@ package de.cracky.notizen.ui
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.os.Build
+import android.view.HapticFeedbackConstants
+import android.view.View
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -38,9 +41,10 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid
+import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
+import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
+import androidx.compose.foundation.lazy.staggeredgrid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -49,12 +53,15 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
@@ -73,6 +80,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -124,13 +132,36 @@ private val DarkNoteColors = mapOf(
     "pink" to Color(0xFF6C394F), "brown" to Color(0xFF4B443A), "gray" to Color(0xFF232427)
 )
 
+private object Haptic {
+    fun tick(v: View) { v.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK) }
+    fun press(v: View) { v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP) }
+    fun longPress(v: View) { v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) }
+    fun confirm(v: View) {
+        v.performHapticFeedback(if (Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.CONFIRM else HapticFeedbackConstants.LONG_PRESS)
+    }
+    fun threshold(v: View) {
+        v.performHapticFeedback(if (Build.VERSION.SDK_INT >= 34) HapticFeedbackConstants.GESTURE_THRESHOLD_ACTIVATE else HapticFeedbackConstants.CLOCK_TICK)
+    }
+}
+
+@Composable
+private fun noteBackground(key: String): Color {
+    val scheme = MaterialTheme.colorScheme
+    if (key == "default") return scheme.background
+    val dark = scheme.background.luminance() < .2f
+    return (if (dark) DarkNoteColors else LightNoteColors)[key] ?: scheme.background
+}
+
 @Composable
 fun NotizenApp(viewModel: NotesViewModel? = null) {
     val vm = viewModel ?: androidx.lifecycle.viewmodel.compose.viewModel<NotesViewModel>()
     val state by vm.state.collectAsStateWithLifecycle()
     val systemDark = androidx.compose.foundation.isSystemInDarkTheme()
     val dark = when (state.themeMode) { "dark" -> true; "light" -> false; else -> systemDark }
-    val colors = remember(dark) { keepScheme(dark) }
+    val appContext = LocalContext.current
+    val colors = remember(dark) {
+        if (Build.VERSION.SDK_INT >= 31) { if (dark) dynamicDarkColorScheme(appContext) else dynamicLightColorScheme(appContext) } else keepScheme(dark)
+    }
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     LaunchedEffect(vm) {
@@ -148,8 +179,6 @@ fun NotizenApp(viewModel: NotesViewModel? = null) {
     SideEffect {
         val window = (view.context as? Activity)?.window
         if (window != null) {
-            window.statusBarColor = colors.background.toArgbCompat()
-            window.navigationBarColor = colors.background.toArgbCompat()
             androidx.core.view.WindowCompat.getInsetsController(window, view).apply {
                 isAppearanceLightStatusBars = !dark
                 isAppearanceLightNavigationBars = !dark
@@ -165,7 +194,7 @@ fun NotizenApp(viewModel: NotesViewModel? = null) {
         else -> 2
     }
     MaterialTheme(colorScheme = colors, typography = Typography()) {
-        Box(Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
             Surface(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding(), color = MaterialTheme.colorScheme.background) {
                 Crossfade(targetState = screen, animationSpec = tween(280), label = "screen") { current ->
                     when (current) {
@@ -271,9 +300,11 @@ private fun LoginScreen(server: String, busy: Boolean, error: String?, vm: Notes
 private fun MainNotesScreen(state: de.cracky.notizen.AppState, vm: NotesViewModel, snackbar: SnackbarHostState) {
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    val view = LocalView.current
     var showSettings by remember { mutableStateOf(false) }
     var showFilter by remember { mutableStateOf(false) }
     var showCreateLabel by remember { mutableStateOf(false) }
+    var showEditLabels by remember { mutableStateOf(false) }
     var labelToManage by remember { mutableStateOf<LabelData?>(null) }
     var confirmTrash by remember { mutableStateOf(false) }
     var confirmPermanent by remember { mutableStateOf(false) }
@@ -289,50 +320,47 @@ private fun MainNotesScreen(state: de.cracky.notizen.AppState, vm: NotesViewMode
     }
     ModalNavigationDrawer(
         drawerState = drawer,
+        // Wischen soll Notizen archivieren, nicht das Menü öffnen: Gesten nur zum Schließen
+        gesturesEnabled = drawer.isOpen,
         drawerContent = {
-            ModalDrawerSheet(Modifier.widthIn(max = 330.dp)) {
-                Row(Modifier.fillMaxWidth().padding(start = 22.dp, top = 26.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Surface(color = KeepYellow, shape = RoundedCornerShape(11.dp), modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Lightbulb, null, tint = Color(0xFF202124), modifier = Modifier.padding(8.dp)) }
-                    Text("Notizen", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 12.dp))
+            ModalDrawerSheet(drawerContainerColor = MaterialTheme.colorScheme.background, modifier = Modifier.widthIn(max = 320.dp)) {
+                Column(Modifier.fillMaxHeight().verticalScroll(rememberScrollState()).padding(bottom = 16.dp)) {
+                    Row(Modifier.padding(start = 28.dp, top = 20.dp, bottom = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Notizen", fontSize = 22.sp, fontWeight = FontWeight.Medium)
+                        if (!state.online) Text("  ·  offline", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    DrawerItem("Notizen", Icons.Outlined.Lightbulb, state.view.kind == "notes") { Haptic.tick(view); vm.setView(ViewKey.NOTES); scope.launch { drawer.close() } }
+                    HorizontalDivider(Modifier.padding(horizontal = 28.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                    Row(Modifier.fillMaxWidth().padding(start = 28.dp, end = 12.dp, top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Labels", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
+                        Text(
+                            "Bearbeiten", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.clip(RoundedCornerShape(16.dp)).clickable { Haptic.tick(view); showEditLabels = true; scope.launch { drawer.close() } }.padding(horizontal = 16.dp, vertical = 8.dp)
+                        )
+                    }
+                    state.labels.forEach { label ->
+                        DrawerItem(label.name, Icons.Outlined.Label, state.view.kind == "label" && state.view.labelId == label.id, onLongClick = { Haptic.longPress(view); labelToManage = label }) {
+                            Haptic.tick(view); vm.setView(ViewKey("label", label.id)); scope.launch { drawer.close() }
+                        }
+                    }
+                    DrawerItem("Neues Label erstellen", Icons.Default.Add, false) { Haptic.tick(view); showCreateLabel = true; scope.launch { drawer.close() } }
+                    HorizontalDivider(Modifier.padding(horizontal = 28.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                    DrawerItem("Archiv", Icons.Outlined.Archive, state.view.kind == "archive") { Haptic.tick(view); vm.setView(ViewKey.ARCHIVE); scope.launch { drawer.close() } }
+                    DrawerItem("Papierkorb", Icons.Outlined.Delete, state.view.kind == "trash") { Haptic.tick(view); vm.setView(ViewKey.TRASH); scope.launch { drawer.close() } }
+                    DrawerItem("Einstellungen", Icons.Outlined.Settings, false) { Haptic.tick(view); showSettings = true; scope.launch { drawer.close() } }
                 }
-                NavigationDrawerItem(label = { Text("Notizen") }, selected = state.view.kind == "notes", icon = { Icon(Icons.Default.Lightbulb, null) }, onClick = { vm.setView(ViewKey.NOTES); scope.launch { drawer.close() } }, modifier = Modifier.padding(horizontal = 12.dp))
-                NavigationDrawerItem(label = { Text("Archiv") }, selected = state.view.kind == "archive", icon = { Icon(Icons.Default.Archive, null) }, onClick = { vm.setView(ViewKey.ARCHIVE); scope.launch { drawer.close() } }, modifier = Modifier.padding(horizontal = 12.dp))
-                NavigationDrawerItem(label = { Text("Papierkorb") }, selected = state.view.kind == "trash", icon = { Icon(Icons.Default.Delete, null) }, onClick = { vm.setView(ViewKey.TRASH); scope.launch { drawer.close() } }, modifier = Modifier.padding(horizontal = 12.dp))
-                HorizontalDivider(Modifier.padding(vertical = 12.dp, horizontal = 20.dp))
-                Row(Modifier.fillMaxWidth().padding(start = 28.dp, end = 16.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Labels", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
-                    IconButton(onClick = { showCreateLabel = true }) { Icon(Icons.Default.Add, "Label hinzufügen") }
-                }
-                state.labels.forEach { label ->
-                    NavigationDrawerItem(
-                        label = { Text(label.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                        selected = state.view.kind == "label" && state.view.labelId == label.id,
-                        icon = { Icon(Icons.Default.Label, null) },
-                        badge = { if (label.shared) Icon(Icons.Default.People, "Geteilt", modifier = Modifier.size(16.dp)) },
-                        onClick = { vm.setView(ViewKey("label", label.id)); scope.launch { drawer.close() } },
-                        modifier = Modifier.padding(horizontal = 12.dp).combinedClickable(onClick = { vm.setView(ViewKey("label", label.id)); scope.launch { drawer.close() } }, onLongClick = { labelToManage = label })
-                    )
-                }
-                Spacer(Modifier.weight(1f))
-                HorizontalDivider(Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
-                ListItem(
-                    headlineContent = { Text(state.user?.username ?: "Konto") },
-                    supportingContent = { Text(if (state.online) "Synchronisiert" else "Offline - Änderungen bleiben lokal") },
-                    leadingContent = { Icon(if (state.online) Icons.Default.CloudDone else Icons.Default.CloudOff, null) },
-                    trailingContent = { IconButton(onClick = { showSettings = true; scope.launch { drawer.close() } }) { Icon(Icons.Default.Settings, "Einstellungen") } },
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
             }
         }
     ) {
         Scaffold(
+            containerColor = MaterialTheme.colorScheme.background,
             snackbarHost = { SnackbarHost(snackbar) },
             topBar = {
                 Crossfade(targetState = state.selected.isNotEmpty(), animationSpec = tween(180), label = "topbar") { selecting ->
                     if (selecting) {
                         SelectionTopBar(state, vm) { if (state.view.kind == "trash") confirmPermanent = true else confirmTrash = true }
                     } else {
-                        MainTopBar(state, vm, onMenu = { scope.launch { drawer.open() } }, onSettings = { showSettings = true }, onFilter = { showFilter = true })
+                        KeepTopBar(state, vm, onMenu = { Haptic.tick(view); scope.launch { drawer.open() } }, onFilter = { showFilter = true }, onAvatar = { showSettings = true })
                     }
                 }
             },
@@ -344,6 +372,7 @@ private fun MainNotesScreen(state: de.cracky.notizen.AppState, vm: NotesViewMode
                 ) {
                     var expanded by remember { mutableStateOf(false) }
                     val rotation by animateFloatAsState(if (expanded) 135f else 0f, spring(dampingRatio = 0.75f, stiffness = Spring.StiffnessMedium), label = "fabRotation")
+                    val dark = MaterialTheme.colorScheme.background.luminance() < .2f
                     Column(horizontalAlignment = Alignment.End) {
                         AnimatedVisibility(
                             visible = expanded,
@@ -351,11 +380,16 @@ private fun MainNotesScreen(state: de.cracky.notizen.AppState, vm: NotesViewMode
                             exit = fadeOut(tween(110)) + scaleOut(tween(130), transformOrigin = TransformOrigin(1f, 1f)) + slideOutVertically(tween(130)) { it / 4 }
                         ) {
                             Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 12.dp)) {
-                                SmallFabAction("Neue Liste", Icons.Default.Checklist) { expanded = false; vm.newNote(true) }
-                                SmallFabAction("Neue Notiz", Icons.Default.EditNote) { expanded = false; vm.newNote(false) }
+                                SmallFabAction("Neue Liste", Icons.Default.Checklist) { Haptic.confirm(view); expanded = false; vm.newNote(true) }
+                                SmallFabAction("Neue Notiz", Icons.Default.EditNote) { Haptic.confirm(view); expanded = false; vm.newNote(false) }
                             }
                         }
-                        FloatingActionButton(onClick = { expanded = !expanded }, containerColor = KeepYellow, contentColor = Color(0xFF202124), shape = RoundedCornerShape(18.dp)) {
+                        FloatingActionButton(
+                            onClick = { Haptic.press(view); expanded = !expanded },
+                            containerColor = if (dark) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = if (dark) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onPrimaryContainer,
+                            shape = RoundedCornerShape(20.dp)
+                        ) {
                             Icon(Icons.Default.Add, if (expanded) "Schließen" else "Neue Notiz", Modifier.rotate(rotation))
                         }
                     }
@@ -380,7 +414,7 @@ private fun MainNotesScreen(state: de.cracky.notizen.AppState, vm: NotesViewMode
                 // Pull-to-Refresh: zieht den Stand vom Server nach (inkl. Labels und Nutzer)
                 PullToRefreshBox(
                     isRefreshing = state.refreshing,
-                    onRefresh = { vm.refreshAll(showIndicator = true) },
+                    onRefresh = { Haptic.confirm(view); vm.refreshAll(showIndicator = true) },
                     modifier = Modifier.fillMaxWidth().weight(1f)
                 ) {
                     AnimatedContent(
@@ -390,24 +424,10 @@ private fun MainNotesScreen(state: de.cracky.notizen.AppState, vm: NotesViewMode
                         },
                         modifier = Modifier.fillMaxSize(),
                         label = "notesView"
-                    ) { (view, grid) ->
-                        val notes = remember(view, state.notes, state.searchActive, state.query, state.searchIds, state.filter) { visibleNotes(state, view) }
-                        if (notes.isEmpty()) {
-                            EmptyNotesState(state, vm)
-                        } else if (grid) {
-                            LazyVerticalGrid(
-                                columns = GridCells.Adaptive(minSize = 168.dp),
-                                modifier = Modifier.fillMaxSize(),
-                                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 104.dp),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                items(notes, key = { it.id }) { note -> NoteCard(note, state, vm, onOpen = { openNoteOrRestore(note, state, vm) }, onSelectTrash = { confirmTrash = true }, modifier = Modifier.animateItem()) }
-                            }
-                        } else {
-                            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 104.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                items(notes, key = { it.id }) { note -> NoteCard(note, state, vm, onOpen = { openNoteOrRestore(note, state, vm) }, onSelectTrash = { confirmTrash = true }, modifier = Modifier.animateItem()) }
-                            }
-                        }
+                    ) { (viewKey, grid) ->
+                        val notes = remember(viewKey, state.notes, state.searchActive, state.query, state.searchIds, state.filter) { visibleNotes(state, viewKey) }
+                        if (notes.isEmpty()) EmptyNotesState(state, vm)
+                        else NotesContent(notes, grid, state, vm) { note -> openNoteOrRestore(note, state, vm) }
                     }
                 }
             }
@@ -416,6 +436,7 @@ private fun MainNotesScreen(state: de.cracky.notizen.AppState, vm: NotesViewMode
     if (showSettings) SettingsDialog(state, vm, onDismiss = { showSettings = false })
     if (showFilter) FilterDialog(state, vm, onDismiss = { showFilter = false })
     if (showCreateLabel) LabelNameDialog("Neues Label", "", onDismiss = { showCreateLabel = false }) { name -> scope.launch { vm.createLabel(name) }; showCreateLabel = false }
+    if (showEditLabels) LabelsEditDialog(state, onDismiss = { showEditLabels = false }, onEdit = { showEditLabels = false; labelToManage = it }, onCreate = { showEditLabels = false; showCreateLabel = true })
     labelToManage?.let { label -> LabelManageDialog(label, state, vm, onDismiss = { labelToManage = null }) }
     if (confirmPermanent) AlertDialog(
         onDismissRequest = { confirmPermanent = false },
@@ -431,6 +452,131 @@ private fun MainNotesScreen(state: de.cracky.notizen.AppState, vm: NotesViewMode
         confirmButton = { TextButton(onClick = { if (state.view.kind == "trash") vm.emptyTrash() else vm.trash(state.selected); confirmTrash = false }) { Text(if (state.view.kind == "trash") "Leeren" else "Löschen") } },
         dismissButton = { TextButton(onClick = { confirmTrash = false }) { Text("Abbrechen") } }
     )
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun DrawerItem(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    selected: Boolean,
+    onLongClick: (() -> Unit)? = null,
+    onClick: () -> Unit
+) {
+    val scheme = MaterialTheme.colorScheme
+    Row(
+        Modifier.padding(horizontal = 12.dp).fillMaxWidth().height(56.dp).clip(CircleShape)
+            .background(if (selected) scheme.secondaryContainer else Color.Transparent)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = if (selected) scheme.onSecondaryContainer else scheme.onSurfaceVariant)
+        Text(
+            label, Modifier.padding(start = 18.dp), color = if (selected) scheme.onSecondaryContainer else scheme.onSurface,
+            fontSize = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun LabelsEditDialog(state: de.cracky.notizen.AppState, onDismiss: () -> Unit, onEdit: (LabelData) -> Unit, onCreate: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Labels bearbeiten") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                TextButton(onClick = onCreate) { Icon(Icons.Default.Add, null); Text("Neues Label erstellen", Modifier.padding(start = 8.dp)) }
+                state.labels.forEach { label ->
+                    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable { onEdit(label) }.padding(horizontal = 8.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Outlined.Label, null)
+                        Text(label.name, Modifier.weight(1f).padding(horizontal = 14.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Icon(Icons.Outlined.Edit, "Bearbeiten")
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Fertig") } }
+    )
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun NotesContent(notes: List<NoteData>, grid: Boolean, state: de.cracky.notizen.AppState, vm: NotesViewModel, onOpen: (NoteData) -> Unit) {
+    val pinned = remember(notes) { notes.filter { it.pinned } }
+    val others = remember(notes, pinned) { if (pinned.isEmpty()) notes else notes.filter { !it.pinned } }
+    val sections = pinned.isNotEmpty()
+    val padding = PaddingValues(start = 8.dp, end = 8.dp, top = 8.dp, bottom = 104.dp)
+    if (grid) {
+        // Staggered-Grid: jede Notiz ist genau so hoch wie ihr Inhalt
+        LazyVerticalStaggeredGrid(
+            columns = StaggeredGridCells.Adaptive(minSize = 168.dp),
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = padding,
+            verticalItemSpacing = 8.dp,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (sections) item(key = "header_pinned", span = StaggeredGridItemSpan.FullLine) { SectionLabel("Angeheftet") }
+            items(pinned, key = { it.id }) { note -> SwipeableNote(note, state, vm, onOpen = { onOpen(note) }, modifier = Modifier.animateItem()) }
+            if (sections && others.isNotEmpty()) item(key = "header_other", span = StaggeredGridItemSpan.FullLine) { SectionLabel("Sonstige") }
+            if (sections) items(others, key = { it.id }) { note -> SwipeableNote(note, state, vm, onOpen = { onOpen(note) }, modifier = Modifier.animateItem()) }
+            else items(notes, key = { it.id }) { note -> SwipeableNote(note, state, vm, onOpen = { onOpen(note) }, modifier = Modifier.animateItem()) }
+        }
+    } else {
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = padding, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (sections) item(key = "header_pinned") { SectionLabel("Angeheftet") }
+            if (sections) {
+                items(pinned, key = { it.id }) { note -> SwipeableNote(note, state, vm, onOpen = { onOpen(note) }, modifier = Modifier.animateItem()) }
+                if (others.isNotEmpty()) item(key = "header_other") { SectionLabel("Sonstige") }
+                items(others, key = { it.id }) { note -> SwipeableNote(note, state, vm, onOpen = { onOpen(note) }, modifier = Modifier.animateItem()) }
+            } else {
+                items(notes, key = { it.id }) { note -> SwipeableNote(note, state, vm, onOpen = { onOpen(note) }, modifier = Modifier.animateItem()) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text.uppercase(), fontSize = 12.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.8.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 2.dp)
+    )
+}
+
+/** Wischen (links oder rechts) archiviert die Notiz bzw. holt sie aus dem Archiv. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SwipeableNote(note: NoteData, state: de.cracky.notizen.AppState, vm: NotesViewModel, onOpen: () -> Unit, modifier: Modifier = Modifier) {
+    val view = LocalView.current
+    val inArchive = state.view.kind == "archive"
+    val canSwipe = state.view.kind != "trash" && state.selected.isEmpty()
+    val dismissState = rememberSwipeToDismissBoxState(positionalThreshold = { total -> total * 0.4f })
+    LaunchedEffect(dismissState.targetValue) {
+        if (dismissState.targetValue != SwipeToDismissBoxValue.Settled) Haptic.threshold(view)
+    }
+    LaunchedEffect(dismissState.currentValue) {
+        if (dismissState.currentValue != SwipeToDismissBoxValue.Settled) {
+            Haptic.confirm(view)
+            vm.setArchived(listOf(note.id), !inArchive)
+        }
+    }
+    SwipeToDismissBox(
+        state = dismissState,
+        modifier = modifier,
+        enableDismissFromStartToEnd = canSwipe,
+        enableDismissFromEndToStart = canSwipe,
+        backgroundContent = {
+            val fromStart = dismissState.dismissDirection == SwipeToDismissBoxValue.StartToEnd
+            Box(Modifier.fillMaxSize().padding(horizontal = 24.dp), contentAlignment = if (fromStart) Alignment.CenterStart else Alignment.CenterEnd) {
+                if (dismissState.dismissDirection != SwipeToDismissBoxValue.Settled) {
+                    Icon(if (inArchive) Icons.Outlined.Unarchive else Icons.Outlined.Archive, if (inArchive) "Aus Archiv holen" else "Archivieren", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+    ) {
+        NoteCard(note, state, vm, onOpen)
+    }
 }
 
 private fun visibleNotes(state: de.cracky.notizen.AppState, view: ViewKey): List<NoteData> =
@@ -462,35 +608,74 @@ private fun openNoteOrRestore(note: NoteData, state: de.cracky.notizen.AppState,
 }
 
 @Composable
-private fun MainTopBar(state: de.cracky.notizen.AppState, vm: NotesViewModel, onMenu: () -> Unit, onSettings: () -> Unit, onFilter: () -> Unit) {
-    Surface(color = MaterialTheme.colorScheme.background, shadowElevation = 1.dp) {
-        Row(Modifier.fillMaxWidth().height(68.dp).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onMenu) { Icon(Icons.Default.Menu, "Navigation öffnen") }
-            Crossfade(targetState = state.searchActive, modifier = Modifier.weight(1f), animationSpec = tween(180), label = "searchbar") { searching ->
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            if (searching) {
-                OutlinedTextField(
-                    value = state.query, onValueChange = vm::setQuery,
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    placeholder = { Text("Notizen durchsuchen") }, singleLine = true,
-                    leadingIcon = { Icon(Icons.Default.Search, null) },
-                    trailingIcon = { if (state.query.isNotEmpty()) IconButton(onClick = { vm.setQuery("") }) { Icon(Icons.Default.Close, "Suche leeren") } },
-                    shape = RoundedCornerShape(28.dp)
-                )
-                IconButton(onClick = vm::closeSearch) { Icon(Icons.Default.Close, "Suche schließen") }
-            } else {
-                Text(
-                    when (state.view.kind) { "archive" -> "Archiv"; "trash" -> "Papierkorb"; "label" -> state.labels.firstOrNull { it.id == state.view.labelId }?.name ?: "Label"; else -> "Notizen" },
-                    style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis
-                )
-                IconButton(onClick = vm::openSearch) { Icon(Icons.Default.Search, "Suchen") }
-                IconButton(onClick = onFilter) { Icon(Icons.Default.FilterList, "Suchfilter") }
-                IconButton(onClick = vm::toggleLayout) { Icon(if (state.gridLayout) Icons.Default.ViewAgenda else Icons.Default.GridView, "Ansicht wechseln") }
-                IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Einstellungen") }
-            }
-            }
+private fun KeepTopBar(state: de.cracky.notizen.AppState, vm: NotesViewModel, onMenu: () -> Unit, onFilter: () -> Unit, onAvatar: () -> Unit) {
+    val view = LocalView.current
+    val scheme = MaterialTheme.colorScheme
+    val mode = if (state.searchActive) 2 else if (state.view.kind == "notes") 0 else 1
+    Crossfade(targetState = mode, animationSpec = tween(180), label = "topbarMode", modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp)) { m ->
+        Row(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            when (m) {
+                2 -> {
+                    IconButton(onClick = { Haptic.tick(view); vm.closeSearch() }) { Icon(Icons.Default.ArrowBack, "Suche schließen") }
+                    SearchField(state, vm, Modifier.weight(1f))
+                    Spacer(Modifier.width(8.dp))
+                }
+                0 -> {
+                    IconButton(onClick = onMenu) { Icon(Icons.Default.Menu, "Navigation öffnen") }
+                    Surface(onClick = { Haptic.tick(view); vm.openSearch() }, shape = RoundedCornerShape(28.dp), color = scheme.surfaceContainerHigh, modifier = Modifier.weight(1f).height(56.dp)) {
+                        Row(Modifier.padding(start = 20.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Notizen durchsuchen", color = scheme.onSurfaceVariant, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            IconButton(onClick = { Haptic.tick(view); vm.toggleLayout() }) { Icon(if (state.gridLayout) Icons.Outlined.ViewAgenda else Icons.Outlined.GridView, "Ansicht wechseln") }
+                            IconButton(onClick = { Haptic.tick(view); onFilter() }) { Icon(Icons.Default.FilterList, "Suchfilter") }
+                        }
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    AvatarButton(state, vm) { Haptic.tick(view); onAvatar() }
+                    Spacer(Modifier.width(8.dp))
+                }
+                else -> {
+                    IconButton(onClick = onMenu) { Icon(Icons.Default.Menu, "Navigation öffnen") }
+                    Text(
+                        when (state.view.kind) { "archive" -> "Archiv"; "trash" -> "Papierkorb"; "label" -> state.labels.firstOrNull { it.id == state.view.labelId }?.name ?: "Label"; else -> "Notizen" },
+                        fontSize = 22.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(start = 8.dp)
+                    )
+                    IconButton(onClick = { Haptic.tick(view); vm.openSearch() }) { Icon(Icons.Default.Search, "Suchen") }
+                    IconButton(onClick = { Haptic.tick(view); vm.toggleLayout() }) { Icon(if (state.gridLayout) Icons.Outlined.ViewAgenda else Icons.Outlined.GridView, "Ansicht wechseln") }
+                    AvatarButton(state, vm) { Haptic.tick(view); onAvatar() }
+                    Spacer(Modifier.width(8.dp))
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun SearchField(state: de.cracky.notizen.AppState, vm: NotesViewModel, modifier: Modifier) {
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+    Surface(modifier.height(56.dp), shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+        TextField(
+            value = state.query, onValueChange = vm::setQuery, singleLine = true,
+            modifier = Modifier.fillMaxSize().focusRequester(focus),
+            placeholder = { Text("Notizen durchsuchen") },
+            trailingIcon = { if (state.query.isNotEmpty()) IconButton(onClick = { vm.setQuery("") }) { Icon(Icons.Default.Close, "Suche leeren") } },
+            colors = TextFieldDefaults.colors(
+                focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent, disabledContainerColor = Color.Transparent,
+                focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent, disabledIndicatorColor = Color.Transparent
+            )
+        )
+    }
+}
+
+@Composable
+private fun AvatarButton(state: de.cracky.notizen.AppState, vm: NotesViewModel, onClick: () -> Unit) {
+    val user = state.user
+    Box(
+        Modifier.size(36.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        if (user?.avatar != null) AsyncImage(vm.avatarUrl(user.id, user.avatar), "Konto", Modifier.fillMaxSize(), contentScale = androidx.compose.ui.layout.ContentScale.Crop)
+        else Text(user?.username?.take(1)?.uppercase() ?: "?", color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.Medium)
     }
 }
 
@@ -499,8 +684,8 @@ private fun SelectionTopBar(state: de.cracky.notizen.AppState, vm: NotesViewMode
     var menu by remember { mutableStateOf(false) }
     var colors by remember { mutableStateOf(false) }
     var labels by remember { mutableStateOf(false) }
-    Surface(color = MaterialTheme.colorScheme.surface, shadowElevation = 1.dp) {
-        Row(Modifier.fillMaxWidth().height(60.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+        Row(Modifier.fillMaxWidth().height(64.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = vm::clearSelection) { Icon(Icons.Default.Close, "Auswahl aufheben") }
             Text("${state.selected.size} ausgewählt", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
             IconButton(onClick = { colors = true }) { Icon(Icons.Default.Palette, "Farbe") }
@@ -528,97 +713,84 @@ private fun SmallFabAction(label: String, icon: androidx.compose.ui.graphics.vec
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun NoteCard(note: NoteData, state: de.cracky.notizen.AppState, vm: NotesViewModel, onOpen: () -> Unit, onSelectTrash: () -> Unit, modifier: Modifier = Modifier) {
-    var menu by remember { mutableStateOf(false) }
-    var colorPicker by remember { mutableStateOf(false) }
-    var labelPicker by remember { mutableStateOf(false) }
-    var confirmPermanent by remember { mutableStateOf(false) }
+private fun NoteCard(note: NoteData, state: de.cracky.notizen.AppState, vm: NotesViewModel, onOpen: () -> Unit, modifier: Modifier = Modifier) {
+    val view = LocalView.current
     val selected = note.id in state.selected
-    val dark = MaterialTheme.colorScheme.background.luminance() < 0.2f
-    val bg = (if (dark) DarkNoteColors else LightNoteColors)[note.color] ?: MaterialTheme.colorScheme.surface
+    val bg = noteBackground(note.color)
     val fg = if (bg.luminance() < 0.38f) Color(0xFFF1F3F4) else Color(0xFF202124)
     val cardScale by animateFloatAsState(if (selected) 0.965f else 1f, spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMediumLow), label = "cardScale")
     val cardBg by animateColorAsState(bg, tween(250), label = "cardBg")
     val primaryColor = MaterialTheme.colorScheme.primary
-    val outlineColor = MaterialTheme.colorScheme.outline.copy(alpha = .55f)
+    val outlineColor = MaterialTheme.colorScheme.outlineVariant
     val borderColor by animateColorAsState(if (selected) primaryColor else if (note.color == "default") outlineColor else Color.Transparent, tween(200), label = "cardBorder")
     val borderWidth by animateDpAsState(if (selected) 2.dp else 1.dp, tween(200), label = "cardBorderWidth")
+    val labels = state.labels.filter { it.id in note.labels }
+    val hasText = note.doc.title.isNotBlank() || (note.doc.isList && note.doc.items.isNotEmpty()) || note.doc.bodyText.isNotBlank() || note.pdfs.isNotEmpty() || labels.isNotEmpty() || note.shared
     Card(
         modifier = modifier.fillMaxWidth().graphicsLayer { scaleX = cardScale; scaleY = cardScale }.combinedClickable(
-            onClick = { if (state.view.kind == "trash") { if (state.selected.isNotEmpty()) vm.toggleSelect(note.id) } else onOpen() },
-            onLongClick = { vm.toggleSelect(note.id) }
+            onClick = {
+                if (state.view.kind == "trash") { if (state.selected.isNotEmpty()) { Haptic.tick(view); vm.toggleSelect(note.id) } }
+                else { if (state.selected.isNotEmpty()) Haptic.tick(view); onOpen() }
+            },
+            onLongClick = { Haptic.longPress(view); vm.toggleSelect(note.id) }
         ),
-        shape = RoundedCornerShape(13.dp), colors = CardDefaults.cardColors(containerColor = cardBg),
+        shape = RoundedCornerShape(12.dp), colors = CardDefaults.cardColors(containerColor = cardBg),
         border = BorderStroke(borderWidth, borderColor),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
-        Column {
-            Box {
+        Box {
+            Column {
                 if (note.images.isNotEmpty()) {
-                    val refs = note.images.take(4)
-                    Column(Modifier.fillMaxWidth().height(if (refs.size == 1) 148.dp else 184.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        refs.chunked(2).forEach { rowImages ->
-                            Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                                rowImages.forEach { image -> AsyncImage(vm.thumbUrl(image.id), null, Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(2.dp)), contentScale = androidx.compose.ui.layout.ContentScale.Crop) }
-                            }
-                        }
+                    // Bilder in natürlichem Seitenverhältnis, ohne feste Höhe
+                    AsyncImage(vm.thumbUrl(note.images.first().id), null, Modifier.fillMaxWidth(), contentScale = androidx.compose.ui.layout.ContentScale.FillWidth)
+                    val more = note.images.drop(1).take(3)
+                    if (more.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                        more.forEach { image -> AsyncImage(vm.thumbUrl(image.id), null, Modifier.weight(1f).aspectRatio(1f), contentScale = androidx.compose.ui.layout.ContentScale.Crop) }
+                        repeat(3 - more.size) { Spacer(Modifier.weight(1f)) }
                     }
                 } else if (note.pdfs.isNotEmpty()) {
-                    AsyncImage(vm.pdfThumbUrl(note.pdfs.first().id), null, Modifier.fillMaxWidth().height(116.dp), contentScale = androidx.compose.ui.layout.ContentScale.Crop)
+                    AsyncImage(vm.pdfThumbUrl(note.pdfs.first().id), null, Modifier.fillMaxWidth(), contentScale = androidx.compose.ui.layout.ContentScale.FillWidth)
                 }
-                if (note.pinned) Icon(Icons.Default.PushPin, "Angeheftet", Modifier.align(Alignment.TopEnd).padding(10.dp).size(18.dp), tint = fg.copy(alpha = .7f))
-                AnimatedVisibility(selected, modifier = Modifier.align(Alignment.TopStart), enter = scaleIn(spring(dampingRatio = 0.6f)) + fadeIn(tween(120)), exit = scaleOut(tween(120)) + fadeOut(tween(100))) {
-                    Surface(Modifier.padding(8.dp).size(27.dp), shape = CircleShape, color = MaterialTheme.colorScheme.primary) { Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.padding(5.dp)) }
+                if (hasText) Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+                    if (note.doc.title.isNotBlank()) Text(
+                        note.doc.title, fontWeight = FontWeight.Medium, fontSize = 16.sp, lineHeight = 22.sp, color = fg,
+                        modifier = Modifier.padding(end = if (note.pinned && note.images.isEmpty() && note.pdfs.isEmpty()) 24.dp else 0.dp)
+                    )
+                    if (note.doc.isList && note.doc.items.isNotEmpty()) {
+                        note.doc.items.take(60).forEach { item ->
+                            Row(verticalAlignment = Alignment.Top, modifier = Modifier.padding(top = 6.dp)) {
+                                Icon(if (item.checked) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank, null, modifier = Modifier.size(18.dp), tint = fg.copy(alpha = .72f))
+                                Text(item.text.ifBlank { "Leeres Listenelement" }, modifier = Modifier.padding(start = 8.dp), fontSize = 14.sp, lineHeight = 19.sp, color = fg.copy(alpha = if (item.checked) .55f else .92f), textDecoration = if (item.checked) TextDecoration.LineThrough else null)
+                            }
+                        }
+                        if (note.doc.items.size > 60) Text("+ ${note.doc.items.size - 60} weitere", color = fg.copy(alpha = .65f), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
+                    } else if (note.doc.bodyText.isNotBlank()) {
+                        Text(note.doc.bodyText, color = fg.copy(alpha = .92f), fontSize = 14.sp, lineHeight = 19.sp, maxLines = 80, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = if (note.doc.title.isNotBlank()) 6.dp else 0.dp))
+                    }
+                    if (note.pdfs.isNotEmpty()) {
+                        Row(Modifier.fillMaxWidth().padding(top = 8.dp).clip(RoundedCornerShape(8.dp)).background(fg.copy(alpha = .08f)).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.PictureAsPdf, null, tint = fg, modifier = Modifier.size(20.dp))
+                            Text(note.pdfs.first().name, Modifier.weight(1f).padding(start = 7.dp), color = fg, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                            if (note.pdfs.size > 1) Text("+${note.pdfs.size - 1}", color = fg, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                    if (labels.isNotEmpty() || note.shared) Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (note.shared) Icon(Icons.Outlined.People, "Geteilt", Modifier.size(18.dp), tint = fg.copy(alpha = .75f))
+                        labels.take(3).forEach { label ->
+                            Surface(color = Color.Transparent, shape = RoundedCornerShape(8.dp), border = BorderStroke(1.dp, fg.copy(alpha = .28f))) {
+                                Text(label.name, Modifier.padding(horizontal = 8.dp, vertical = 3.dp), color = fg.copy(alpha = .9f), style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                        if (labels.size > 3) Text("+${labels.size - 3}", color = fg.copy(alpha = .7f), style = MaterialTheme.typography.labelSmall)
+                    }
                 }
-                if (note.shared) Icon(Icons.Default.People, "Geteilt", Modifier.align(Alignment.TopStart).padding(10.dp).size(18.dp), tint = fg.copy(alpha = .75f))
             }
-            Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
-                if (note.doc.title.isNotBlank()) Text(note.doc.title, fontWeight = FontWeight.Medium, fontSize = 16.sp, color = fg, maxLines = 4, overflow = TextOverflow.Ellipsis)
-                if (note.doc.isList && note.doc.items.isNotEmpty()) {
-                    note.doc.items.take(4).forEach { item ->
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 5.dp)) {
-                            Icon(if (item.checked) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank, null, modifier = Modifier.size(17.dp), tint = fg.copy(alpha = .72f))
-                            Text(item.text.ifBlank { "Leeres Listenelement" }, modifier = Modifier.padding(start = 7.dp), color = fg.copy(alpha = if (item.checked) .55f else .9f), textDecoration = if (item.checked) TextDecoration.LineThrough else null, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
-                        }
-                    }
-                    if (note.doc.items.size > 4) Text("+ ${note.doc.items.size - 4} weitere", color = fg.copy(alpha = .65f), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 5.dp))
-                } else if (note.doc.bodyText.isNotBlank()) {
-                    Text(note.doc.bodyText, color = fg.copy(alpha = .9f), style = MaterialTheme.typography.bodyMedium, maxLines = 8, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = if (note.doc.title.isNotBlank()) 4.dp else 0.dp))
-                }
-                if (note.pdfs.isNotEmpty()) {
-                    Row(Modifier.fillMaxWidth().padding(top = 8.dp).clip(RoundedCornerShape(8.dp)).background(fg.copy(alpha = .08f)).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.PictureAsPdf, null, tint = fg, modifier = Modifier.size(20.dp))
-                        Text(note.pdfs.first().name, Modifier.weight(1f).padding(start = 7.dp), color = fg, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
-                        if (note.pdfs.size > 1) Text("+${note.pdfs.size - 1}", color = fg, style = MaterialTheme.typography.labelSmall)
-                    }
-                }
-                val labels = state.labels.filter { it.id in note.labels }
-                if (labels.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    labels.take(3).forEach { label -> Surface(color = fg.copy(alpha = .1f), shape = RoundedCornerShape(20.dp)) { Text(label.name, Modifier.padding(horizontal = 8.dp, vertical = 4.dp), color = fg.copy(alpha = .9f), style = MaterialTheme.typography.labelSmall, maxLines = 1) } }
-                }
-                Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(if (note.updatedAt > 0) DateFormat.getDateInstance(DateFormat.SHORT).format(Date(note.updatedAt * 1000)) else "", color = fg.copy(alpha = .55f), style = MaterialTheme.typography.labelSmall, modifier = Modifier.weight(1f))
-                    IconButton(onClick = { menu = true }, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.MoreVert, "Notizaktionen", tint = fg.copy(alpha = .65f), modifier = Modifier.size(18.dp)) }
-                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        if (state.view.kind == "trash") {
-                            DropdownMenuItem(text = { Text("Wiederherstellen") }, leadingIcon = { Icon(Icons.Default.RestoreFromTrash, null) }, onClick = { vm.restore(listOf(note.id)); menu = false })
-                            DropdownMenuItem(text = { Text("Endgültig löschen") }, leadingIcon = { Icon(Icons.Default.DeleteForever, null) }, onClick = { confirmPermanent = true; menu = false })
-                        } else {
-                            DropdownMenuItem(text = { Text(if (note.pinned) "Lösen" else "Anheften") }, leadingIcon = { Icon(Icons.Default.PushPin, null) }, onClick = { vm.setPinned(listOf(note.id), !note.pinned); menu = false })
-                            DropdownMenuItem(text = { Text(if (note.archived) "Aus Archiv holen" else "Archivieren") }, leadingIcon = { Icon(Icons.Default.Archive, null) }, onClick = { vm.setArchived(listOf(note.id), !note.archived); menu = false })
-                            DropdownMenuItem(text = { Text("Farbe ändern") }, leadingIcon = { Icon(Icons.Default.Palette, null) }, onClick = { colorPicker = true; menu = false })
-                            DropdownMenuItem(text = { Text("Labels bearbeiten") }, leadingIcon = { Icon(Icons.Default.Label, null) }, onClick = { labelPicker = true; menu = false })
-                            DropdownMenuItem(text = { Text("Kopie erstellen") }, leadingIcon = { Icon(Icons.Default.ContentCopy, null) }, onClick = { vm.copy(listOf(note.id)); menu = false })
-                            DropdownMenuItem(text = { Text("Löschen") }, leadingIcon = { Icon(Icons.Default.Delete, null) }, onClick = { vm.trash(listOf(note.id)); menu = false })
-                        }
-                    }
-                }
+            if (note.pinned) Icon(Icons.Default.PushPin, "Angeheftet", Modifier.align(Alignment.TopEnd).padding(10.dp).size(18.dp), tint = fg.copy(alpha = .7f))
+            AnimatedVisibility(selected, modifier = Modifier.align(Alignment.TopStart), enter = scaleIn(spring(dampingRatio = 0.6f)) + fadeIn(tween(120)), exit = scaleOut(tween(120)) + fadeOut(tween(100))) {
+                Surface(Modifier.padding(8.dp).size(27.dp), shape = CircleShape, color = MaterialTheme.colorScheme.primary) { Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.padding(5.dp)) }
             }
         }
     }
-    if (confirmPermanent) AlertDialog(onDismissRequest = { confirmPermanent = false }, title = { Text("Endgültig löschen?") }, text = { Text("Die Notiz kann danach nicht wiederhergestellt werden.") }, confirmButton = { TextButton(onClick = { vm.deleteForever(listOf(note.id)); confirmPermanent = false }) { Text("Löschen") } }, dismissButton = { TextButton(onClick = { confirmPermanent = false }) { Text("Abbrechen") } })
-    if (colorPicker) ColorPickerDialog(onDismiss = { colorPicker = false }) { vm.setColor(listOf(note.id), it); colorPicker = false }
-    if (labelPicker) LabelPickerDialog(state.labels, note.labels, onDismiss = { labelPicker = false }) { vm.setLabels(note.id, it); labelPicker = false }
 }
 
 @Composable
@@ -729,70 +901,93 @@ private fun EditorScreen(state: de.cracky.notizen.AppState, editor: de.cracky.no
     }
     var attachmentMenu by remember { mutableStateOf(false) }
     val dark = MaterialTheme.colorScheme.background.luminance() < .2f
-    val noteBg = (if (dark) DarkNoteColors else LightNoteColors)[draftColor] ?: MaterialTheme.colorScheme.surface
+    val noteBg = noteBackground(draftColor)
     val noteFg = if (noteBg.luminance() < .38f) Color(0xFFF1F3F4) else Color(0xFF202124)
+    val view = LocalView.current
+    var showFormat by remember(editor.key) { mutableStateOf(false) }
+    val titleFocus = remember { FocusRequester() }
+    LaunchedEffect(editor.key, editor.loading) {
+        if (editor.isNew && !editor.loading) runCatching { titleFocus.requestFocus() }
+    }
+    val editedLabel = when {
+        editor.pending || editor.uploading > 0 -> "Speichern…"
+        note != null && note.updatedAt > 0 -> {
+            val ms = note.updatedAt * 1000
+            "Bearbeitet: " + if (android.text.format.DateUtils.isToday(ms)) DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(ms)) else DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(ms))
+        }
+        else -> ""
+    }
     // Predictive Back: Editor schrumpft beim Wischen mit, bei Abbruch federt er zurück
     val backProgress = remember { Animatable(0f) }
     PredictiveBackHandler(enabled = state.editor != null) { progress ->
         try {
             progress.collect { event -> backProgress.snapTo(event.progress) }
+            Haptic.tick(view)
             vm.closeEditor()
         } catch (e: CancellationException) {
             backProgress.animateTo(0f, tween(180))
         }
     }
-    run {
-        Surface(
-            Modifier.fillMaxSize().pointerInput(Unit) {}.graphicsLayer {
-                val p = backProgress.value
-                val factor = 1f - 0.08f * p
-                scaleX = factor
-                scaleY = factor
-                translationY = p * 12.dp.toPx()
-                if (p > 0f) {
-                    clip = true
-                    shape = RoundedCornerShape(p * 28.dp.toPx())
+    Surface(
+        Modifier.fillMaxSize().pointerInput(Unit) {}.graphicsLayer {
+            val p = backProgress.value
+            val factor = 1f - 0.08f * p
+            scaleX = factor
+            scaleY = factor
+            translationY = p * 12.dp.toPx()
+            if (p > 0f) {
+                clip = true
+                shape = RoundedCornerShape(p * 28.dp.toPx())
+            }
+        },
+        color = noteBg
+    ) {
+        Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
+            // ---- obere Leiste (wie Google Notizen): zurück | rückgängig, wiederholen, anheften, archivieren
+            Row(Modifier.fillMaxWidth().height(64.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = { Haptic.tick(view); vm.closeEditor() }) { Icon(Icons.Default.ArrowBack, "Zurück", tint = noteFg) }
+                Spacer(Modifier.weight(1f))
+                IconButton(onClick = { Haptic.tick(view); vm.undo() }, enabled = editor.canUndo) { Icon(Icons.Default.Undo, "Rückgängig", tint = noteFg.copy(alpha = if (editor.canUndo) 1f else .35f)) }
+                IconButton(onClick = { Haptic.tick(view); vm.redo() }, enabled = editor.canRedo) { Icon(Icons.Default.Redo, "Wiederholen", tint = noteFg.copy(alpha = if (editor.canRedo) 1f else .35f)) }
+                IconButton(onClick = { note?.let { Haptic.confirm(view); vm.setPinned(listOf(it.id), !it.pinned) } }, enabled = note != null) {
+                    Icon(if (note?.pinned == true) Icons.Default.PushPin else Icons.Outlined.PushPin, if (note?.pinned == true) "Lösen" else "Anheften", tint = noteFg)
                 }
-            },
-            color = noteBg
-        ) {
-            Column(Modifier.fillMaxSize().statusBarsPadding().imePadding()) {
-                Row(Modifier.fillMaxWidth().height(58.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = vm::closeEditor) { Icon(Icons.Default.ArrowBack, "Schließen", tint = noteFg) }
-                    if (editor.pending || editor.uploading > 0) {
-                        CircularProgressIndicator(Modifier.size(17.dp), strokeWidth = 2.dp, color = noteFg.copy(alpha = .75f))
-                    } else Icon(Icons.Default.CloudDone, "Gespeichert", tint = noteFg.copy(alpha = .6f))
-                    Spacer(Modifier.weight(1f))
-                    IconButton(onClick = vm::undo, enabled = editor.canUndo) { Icon(Icons.Default.Undo, "Rückgängig", tint = noteFg) }
-                    IconButton(onClick = vm::redo, enabled = editor.canRedo) { Icon(Icons.Default.Redo, "Wiederholen", tint = noteFg) }
-                    Box {
-                        IconButton(onClick = { showMenu = true }) { Icon(Icons.Default.MoreVert, "Weitere Aktionen", tint = noteFg) }
-                        DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
-                            DropdownMenuItem(text = { Text(if (note?.pinned == true) "Lösen" else "Anheften") }, leadingIcon = { Icon(Icons.Default.PushPin, null) }, enabled = note != null, onClick = { note?.let { vm.setPinned(listOf(it.id), !it.pinned) }; showMenu = false })
-                            DropdownMenuItem(text = { Text(if (note?.archived == true) "Aus Archiv holen" else "Archivieren") }, leadingIcon = { Icon(Icons.Default.Archive, null) }, enabled = note != null, onClick = { note?.let { vm.setArchived(listOf(it.id), !it.archived) }; vm.closeEditor(); showMenu = false })
-                            DropdownMenuItem(text = { Text("Versionen") }, leadingIcon = { Icon(Icons.Default.History, null) }, enabled = note != null, onClick = { showVersions = true; showMenu = false })
-                            DropdownMenuItem(text = { Text("Zusammenarbeit") }, leadingIcon = { Icon(Icons.Default.People, null) }, enabled = note != null, onClick = { vm.loadUsers(); showCollaborators = true; showMenu = false })
-                            DropdownMenuItem(text = { Text("Kopie erstellen") }, leadingIcon = { Icon(Icons.Default.ContentCopy, null) }, enabled = note != null, onClick = { note?.let { vm.copy(listOf(it.id)) }; showMenu = false })
-                            DropdownMenuItem(text = { Text("In Papierkorb") }, leadingIcon = { Icon(Icons.Default.Delete, null) }, enabled = note != null, onClick = { note?.let { vm.trash(listOf(it.id)) }; vm.closeEditor(); showMenu = false })
-                            DropdownMenuItem(text = { Text("Notiz teilen") }, leadingIcon = { Icon(Icons.Default.Share, null) }, onClick = {
-                                val share = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, editor.doc.title + "\n" + if (editor.doc.isList) editor.doc.items.joinToString("\n") { if (it.checked) "☑ ${it.text}" else "☐ ${it.text}" } else editor.doc.bodyText)
-                                context.startActivity(Intent.createChooser(share, "Notiz teilen")); showMenu = false
-                            })
+                IconButton(onClick = { note?.let { Haptic.confirm(view); vm.setArchived(listOf(it.id), !it.archived); vm.closeEditor() } }, enabled = note != null) {
+                    Icon(if (note?.archived == true) Icons.Outlined.Unarchive else Icons.Outlined.Archive, if (note?.archived == true) "Aus Archiv holen" else "Archivieren", tint = noteFg)
+                }
+            }
+            // ---- Inhalt
+            if (editor.loading) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+            else Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
+                    note?.images?.forEach { image ->
+                        Box(Modifier.fillMaxWidth().padding(bottom = 4.dp).clickable { imagePreview = image.id }) {
+                            AsyncImage(vm.imageUrl(image.id), null, Modifier.fillMaxWidth().heightIn(max = 360.dp), contentScale = androidx.compose.ui.layout.ContentScale.FillWidth)
+                            IconButton(onClick = { vm.deleteImage(note.id, image.id) }, modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).background(Color.Black.copy(.45f), CircleShape)) { Icon(Icons.Default.Close, "Bild entfernen", tint = Color.White) }
                         }
                     }
-                }
-                if (editor.loading) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-                else Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 22.dp)) {
+                    note?.pdfs?.forEach { pdf ->
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp).clip(RoundedCornerShape(12.dp)).background(noteFg.copy(alpha = .08f)).clickable {
+                            scope.launch { openPdf(context, vm, pdf.id, pdf.name) }
+                        }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.PictureAsPdf, null, tint = noteFg, modifier = Modifier.size(34.dp))
+                            Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
+                                Text(pdf.name, color = noteFg, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                                Text("${formatBytes(pdf.size)}  ·  ${pdf.pages} Seiten", color = noteFg.copy(alpha = .65f), style = MaterialTheme.typography.bodySmall)
+                            }
+                            IconButton(onClick = { vm.deletePdf(note.id, pdf.id) }) { Icon(Icons.Default.DeleteOutline, "PDF entfernen", tint = noteFg) }
+                        }
+                    }
+                Column(Modifier.padding(horizontal = 20.dp)) {
                     BasicTextField(
                         value = title, onValueChange = { next ->
                             val delta = diffDelta(title.text, next.text)
                             title = next
                             if (!delta.isEmpty()) vm.applyLocal(listOf(SubOp.Text("title", delta)), "title")
                         },
-                        modifier = Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 8.dp),
-                        textStyle = TextStyle(color = noteFg, fontSize = 23.sp, fontWeight = FontWeight.Medium, lineHeight = 30.sp),
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp).focusRequester(titleFocus),
+                        textStyle = TextStyle(color = noteFg, fontSize = 22.sp, fontWeight = FontWeight.Medium, lineHeight = 28.sp),
                         cursorBrush = SolidColor(noteFg), decorationBox = { inner ->
-                            Box { if (title.text.isEmpty()) Text("Titel", color = noteFg.copy(alpha = .58f), fontSize = 23.sp); inner() }
+                            Box { if (title.text.isEmpty()) Text("Titel", color = noteFg.copy(alpha = .5f), fontSize = 22.sp, fontWeight = FontWeight.Medium); inner() }
                         }
                     )
                     if (editor.doc.isList) {
@@ -826,14 +1021,25 @@ private fun EditorScreen(state: de.cracky.notizen.AppState, editor: de.cracky.no
                                 body = next
                                 if (!delta.isEmpty()) vm.applyLocal(listOf(SubOp.Text("body", delta)), "body")
                             },
-                            modifier = Modifier.fillMaxWidth().heightIn(min = 230.dp).padding(top = 4.dp, bottom = 16.dp),
-                            textStyle = TextStyle(color = noteFg, fontSize = 16.sp, lineHeight = 25.sp),
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 240.dp).padding(top = 4.dp, bottom = 16.dp),
+                            textStyle = TextStyle(color = noteFg, fontSize = 16.sp, lineHeight = 24.sp, fontWeight = FontWeight.Normal),
                             cursorBrush = SolidColor(noteFg), visualTransformation = VisualTransformation { value ->
                                 val currentStyled = if (value.text == body.text) display else AnnotatedString(value.text)
                                 androidx.compose.ui.text.input.TransformedText(currentStyled, androidx.compose.ui.text.input.OffsetMapping.Identity)
                             },
-                            decorationBox = { inner -> Box { if (body.text.isEmpty()) Text("Notiz", color = noteFg.copy(alpha = .58f), fontSize = 16.sp); inner() } }
+                            decorationBox = { inner -> Box { if (body.text.isEmpty()) Text("Notiz", color = noteFg.copy(alpha = .5f), fontSize = 16.sp, fontWeight = FontWeight.Normal); inner() } }
                         )
+                    }
+                    if (editor.uploading > 0) Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp); Text("  ${editor.uploading} Datei(en) werden hochgeladen", color = noteFg.copy(alpha = .7f), style = MaterialTheme.typography.bodySmall) }
+                    if (note != null && note.labels.isNotEmpty()) Row(Modifier.padding(top = 8.dp, bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        state.labels.filter { it.id in note.labels }.forEach { AssistChip(onClick = { showLabels = true }, label = { Text(it.name) }, leadingIcon = { Icon(Icons.Default.Label, null, Modifier.size(16.dp)) }) }
+                    }
+                }
+            }
+            // ---- Formatierung (nur bei Textnotizen, über "Aa" ein-/ausblendbar)
+            AnimatedVisibility(visible = showFormat && !editor.doc.isList && !editor.loading, enter = fadeIn(tween(160)) + expandVertically(tween(200)), exit = fadeOut(tween(100)) + shrinkVertically(tween(160))) {
+                Column {
+                    HorizontalDivider(color = noteFg.copy(alpha = .12f))
                         RichToolbar(noteFg, body, editor.doc.body) { attr, value ->
                             val selection = body.selection.let { minOf(it.start, it.end) to maxOf(it.start, it.end) }
                             val (start, end) = selection
@@ -849,63 +1055,57 @@ private fun EditorScreen(state: de.cracky.notizen.AppState, editor: de.cracky.no
                             }
                             vm.applyLocal(listOf(SubOp.Text("body", delta)))
                         }
-                    }
-                    if (editor.uploading > 0) Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp); Text("  ${editor.uploading} Datei(en) werden hochgeladen", color = noteFg.copy(alpha = .7f), style = MaterialTheme.typography.bodySmall) }
-                    note?.images?.forEach { image ->
-                        Box(Modifier.fillMaxWidth().padding(vertical = 5.dp).clip(RoundedCornerShape(12.dp)).clickable { imagePreview = image.id }) {
-                            AsyncImage(vm.imageUrl(image.id), null, Modifier.fillMaxWidth().heightIn(max = 360.dp), contentScale = androidx.compose.ui.layout.ContentScale.FillWidth)
-                            IconButton(onClick = { vm.deleteImage(note.id, image.id) }, modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).background(Color.Black.copy(.45f), CircleShape)) { Icon(Icons.Default.Close, "Bild entfernen", tint = Color.White) }
-                        }
-                    }
-                    note?.pdfs?.forEach { pdf ->
-                        Row(Modifier.fillMaxWidth().padding(vertical = 5.dp).clip(RoundedCornerShape(12.dp)).background(noteFg.copy(alpha = .08f)).clickable {
-                            scope.launch { openPdf(context, vm, pdf.id, pdf.name) }
-                        }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.PictureAsPdf, null, tint = noteFg, modifier = Modifier.size(34.dp))
-                            Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                                Text(pdf.name, color = noteFg, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
-                                Text("${formatBytes(pdf.size)}  ·  ${pdf.pages} Seiten", color = noteFg.copy(alpha = .65f), style = MaterialTheme.typography.bodySmall)
-                            }
-                            IconButton(onClick = { vm.deletePdf(note.id, pdf.id) }) { Icon(Icons.Default.DeleteOutline, "PDF entfernen", tint = noteFg) }
-                        }
-                    }
-                    if (note != null && note.labels.isNotEmpty()) Row(Modifier.padding(top = 8.dp, bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        state.labels.filter { it.id in note.labels }.forEach { AssistChip(onClick = { showLabels = true }, label = { Text(it.name) }, leadingIcon = { Icon(Icons.Default.Label, null, Modifier.size(16.dp)) }) }
+                }
+            }
+            // ---- untere Leiste: hinzufügen | Farbe | Aa | Bearbeitet-Zeit | Menü
+            Row(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box {
+                    IconButton(onClick = { Haptic.tick(view); attachmentMenu = true }) { Icon(Icons.Outlined.AddBox, "Hinzufügen", tint = noteFg) }
+                    DropdownMenu(expanded = attachmentMenu, onDismissRequest = { attachmentMenu = false }) {
+                        DropdownMenuItem(text = { Text("Foto aufnehmen") }, leadingIcon = { Icon(Icons.Outlined.CameraAlt, null) }, onClick = {
+                            attachmentMenu = false
+                            runCatching {
+                                val dir = java.io.File(context.cacheDir, "camera").apply { mkdirs() }
+                                val file = java.io.File.createTempFile("notiz_", ".jpg", dir)
+                                val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+                                cameraUri = uri
+                                camera.launch(uri)
+                            }.onFailure { vm.message(it.message ?: "Kamera konnte nicht gestartet werden.", important = true) }
+                        })
+                        DropdownMenuItem(text = { Text("Bild oder PDF auswählen") }, leadingIcon = { Icon(Icons.Outlined.Image, null) }, onClick = { attachmentMenu = false; picker.launch(arrayOf("image/*", "application/pdf")) })
+                        DropdownMenuItem(
+                            text = { Text(if (editor.doc.isList) "Kontrollkästchen ausblenden" else "Kontrollkästchen anzeigen") },
+                            leadingIcon = { Icon(if (editor.doc.isList) Icons.Outlined.EditNote else Icons.Outlined.Checklist, null) },
+                            onClick = { attachmentMenu = false; vm.applyLocal(listOf(SubOp.SetList(!editor.doc.isList))) }
+                        )
                     }
                 }
-                HorizontalDivider(color = noteFg.copy(alpha = .15f))
-                Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 8.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                    IconButton(onClick = { showColors = true }) { Icon(Icons.Default.Palette, "Notizfarbe", tint = noteFg) }
-                    Box {
-                        IconButton(onClick = { attachmentMenu = true }) { Icon(Icons.Default.AttachFile, "Bild oder PDF anhängen", tint = noteFg) }
-                        DropdownMenu(expanded = attachmentMenu, onDismissRequest = { attachmentMenu = false }) {
-                            DropdownMenuItem(text = { Text("Bild oder PDF auswählen") }, leadingIcon = { Icon(Icons.Default.FolderOpen, null) }, onClick = { attachmentMenu = false; picker.launch(arrayOf("image/*", "application/pdf")) })
-                            DropdownMenuItem(text = { Text("Foto aufnehmen") }, leadingIcon = { Icon(Icons.Default.CameraAlt, null) }, onClick = {
-                                attachmentMenu = false
-                                runCatching {
-                                    val dir = java.io.File(context.cacheDir, "camera").apply { mkdirs() }
-                                    val file = java.io.File.createTempFile("notiz_", ".jpg", dir)
-                                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
-                                    cameraUri = uri
-                                    camera.launch(uri)
-                                }.onFailure { vm.message(it.message ?: "Kamera konnte nicht gestartet werden.", important = true) }
-                            })
-                        }
+                IconButton(onClick = { Haptic.tick(view); showColors = true }) { Icon(Icons.Outlined.Palette, "Farbe", tint = noteFg) }
+                if (!editor.doc.isList) IconButton(onClick = { Haptic.tick(view); showFormat = !showFormat }) {
+                    Icon(Icons.Outlined.TextFormat, "Textformatierung", tint = if (showFormat) MaterialTheme.colorScheme.primary else noteFg)
+                }
+                Text(editedLabel, Modifier.weight(1f), textAlign = TextAlign.Center, color = noteFg.copy(alpha = .65f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Box {
+                    IconButton(onClick = { Haptic.tick(view); showMenu = true }) { Icon(Icons.Default.MoreVert, "Weitere Aktionen", tint = noteFg) }
+                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                        DropdownMenuItem(text = { Text("Löschen") }, leadingIcon = { Icon(Icons.Outlined.Delete, null) }, enabled = note != null, onClick = { note?.let { vm.trash(listOf(it.id)) }; vm.closeEditor(); showMenu = false })
+                        DropdownMenuItem(text = { Text("Kopie erstellen") }, leadingIcon = { Icon(Icons.Outlined.ContentCopy, null) }, enabled = note != null, onClick = { note?.let { vm.copy(listOf(it.id)) }; showMenu = false })
+                        DropdownMenuItem(text = { Text("Senden") }, leadingIcon = { Icon(Icons.Outlined.Share, null) }, onClick = {
+                            val share = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, editor.doc.title + "\n" + if (editor.doc.isList) editor.doc.items.joinToString("\n") { if (it.checked) "☑ ${it.text}" else "☐ ${it.text}" } else editor.doc.bodyText)
+                            context.startActivity(Intent.createChooser(share, "Notiz teilen")); showMenu = false
+                        })
+                        DropdownMenuItem(text = { Text("Labels") }, leadingIcon = { Icon(Icons.Outlined.Label, null) }, onClick = { showLabels = true; showMenu = false })
+                        DropdownMenuItem(text = { Text("Zusammenarbeit") }, leadingIcon = { Icon(Icons.Outlined.People, null) }, enabled = note != null, onClick = { vm.loadUsers(); showCollaborators = true; showMenu = false })
+                        DropdownMenuItem(text = { Text("Versionen") }, leadingIcon = { Icon(Icons.Outlined.History, null) }, enabled = note != null, onClick = { showVersions = true; showMenu = false })
                     }
-                    IconButton(onClick = { showLabels = true }) { Icon(Icons.Default.Label, "Labels", tint = noteFg) }
-                    if (note != null) {
-                        IconButton(onClick = { vm.loadUsers(); showCollaborators = true }) { Icon(Icons.Default.People, "Zusammenarbeit", tint = noteFg) }
-                        IconButton(onClick = { showVersions = true }) { Icon(Icons.Default.History, "Versionsverlauf", tint = noteFg) }
-                    }
-                    IconButton(onClick = { vm.applyLocal(listOf(SubOp.SetList(!editor.doc.isList))) }) { Icon(if (editor.doc.isList) Icons.Default.EditNote else Icons.Default.Checklist, "Listenmodus", tint = noteFg) }
                 }
             }
         }
     }
-    if (showColors) ColorPickerDialog(draftColor, onDismiss = { showColors = false }) { color ->
+    if (showColors) ColorSheet(draftColor, onDismiss = { showColors = false }) { color ->
+        Haptic.tick(view)
         draftColor = color
         if (note != null) vm.setColor(listOf(note.id), color) else vm.editorAction { id -> vm.setColor(listOf(id), color) }
-        showColors = false
     }
     if (showLabels) LabelPickerDialog(state.labels, note?.labels.orEmpty(), onDismiss = { showLabels = false }) { selectedLabels ->
         if (note != null) vm.setLabels(note.id, selectedLabels) else vm.editorAction { id -> vm.setLabels(id, selectedLabels) }
@@ -946,7 +1146,7 @@ private fun ChecklistEditor(items: List<DocItem>, fg: Color, addBottom: Boolean,
 
 @Composable
 private fun RichToolbar(fg: Color, body: TextFieldValue, delta: Delta, onFormat: (String, Any?) -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
         val hasSelection = body.selection.start != body.selection.end
         val start = minOf(body.selection.start, body.selection.end)
         val end = maxOf(body.selection.start, body.selection.end)
@@ -1085,6 +1285,26 @@ private fun diffDelta(old: String, new: String): Delta {
 @Composable
 private fun ColorPickerDialog(selected: String = "default", onDismiss: () -> Unit, onSelect: (String) -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Farbe auswählen") }, text = { ColorSwatches(selected, onSelect) }, confirmButton = { TextButton(onClick = onDismiss) { Text("Schließen") } })
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ColorSheet(selected: String, onDismiss: () -> Unit, onSelect: (String) -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Text("Farbe", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(start = 24.dp, bottom = 12.dp))
+        Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+            KeepPalette.forEach { (id, label) ->
+                val color = noteBackground(id)
+                Box(
+                    Modifier.size(44.dp).clip(CircleShape).background(color).border(1.dp, MaterialTheme.colorScheme.outline, CircleShape).clickable { onSelect(id) },
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (id == selected) Icon(Icons.Default.Check, label, tint = if (color.luminance() < .4f) Color.White else Color(0xFF202124), modifier = Modifier.size(22.dp))
+                }
+            }
+        }
+        Spacer(Modifier.navigationBarsPadding().height(24.dp))
+    }
 }
 
 @Composable

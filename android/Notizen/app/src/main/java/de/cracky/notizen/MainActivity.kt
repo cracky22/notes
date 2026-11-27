@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.os.Parcelable
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import de.cracky.notizen.ui.NotizenApp
@@ -18,6 +19,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         createdAt = android.os.SystemClock.uptimeMillis()
         val splash = installSplashScreen()
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         splash.setKeepOnScreenCondition {
             !notesViewModel.state.value.initialized && android.os.SystemClock.uptimeMillis() - createdAt < 700L

@@ -20,6 +20,12 @@ Native Android-App für den mitgelieferten FastAPI-Notizenserver. Die Oberfläch
 - Die Android-Zurück-Geste schließt die App nicht mehr: sie schließt zuerst Editor/Suche/Auswahl/Menü, dann geht sie aus Archiv/Papierkorb/Label zurück zu „Notizen“; auf der Startansicht passiert nichts.
 - App-Icon: `python tools/make_icon.py pfad/zu/static/logo.svg --bg "#FFFFFF"` (benötigt `pip install cairosvg pillow`) erzeugt alle Icon-Größen und stellt den Splash um.
 
+## Keep-Look (2.2.0)
+
+- Menü, Suchleiste, Notizkarten und Editor sind an Google Notizen angelehnt; auf Android 12+ werden die Systemfarben (Material You) verwendet.
+- Notizen haben keine feste Höhe mehr (versetztes Raster), Wischen nach links/rechts archiviert (bzw. holt aus dem Archiv), mit „Rückgängig“.
+- Haptisches Feedback bei Auswahl, Wischen, Aktualisieren, Anheften und Bedienelementen.
+
 ## Bauen
 
 1. JDK 17, Android SDK 35 und Android Studio mit Android Gradle Plugin 8.7.3 verwenden.
