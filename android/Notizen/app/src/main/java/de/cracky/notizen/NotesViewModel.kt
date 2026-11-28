@@ -40,6 +40,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import java.io.File
 
 data class ViewKey(val kind: String, val labelId: Int? = null) {
@@ -80,6 +84,7 @@ data class AppState(
     val searchIds: Set<Int>? = null,
     val selected: Set<Int> = emptySet(),
     val gridLayout: Boolean = true,
+    val quickNote: Boolean = false,
     val themeMode: String = "system",
     val online: Boolean = false,
     val refreshing: Boolean = false,
@@ -110,6 +115,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         AppState(
             serverUrl = repo.api.baseUrl,
             gridLayout = prefs.getBoolean("grid", true),
+            quickNote = prefs.getBoolean("quick_note", false),
             themeMode = prefs.getString("theme", "system") ?: "system"
         )
     )
@@ -201,6 +207,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
                     if (progressive) _state.update { s -> s.copy(notes = mergeServer(page, s.notes)) }
                 }
                 _state.update { s -> s.copy(notes = mergeServer(fresh, s.notes), firstLoad = false) }
+                if (_state.value.view.kind == "archive") loadDeferredNotes()
                 launch { runCatching { repo.labels(user.id) }.onSuccess { l -> _state.update { it.copy(labels = l) } } }
                 launch { runCatching { repo.users(user.id) }.onSuccess { u -> _state.update { it.copy(users = u) } } }
             } catch (e: ApiException) {
@@ -312,7 +319,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         sessions.clear()
         draft = null
         _state.update {
-            AppState(initialized = true, serverUrl = repo.api.baseUrl, gridLayout = it.gridLayout, themeMode = it.themeMode,
+            AppState(initialized = true, serverUrl = repo.api.baseUrl, gridLayout = it.gridLayout, quickNote = it.quickNote, themeMode = it.themeMode,
                 loginError = "Deine Sitzung ist abgelaufen. Bitte melde dich erneut an.")
         }
     }
@@ -322,7 +329,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putBoolean("signed_in", false).apply()
         sessions.clear()
         draft = null
-        _state.update { AppState(initialized = true, serverUrl = repo.api.baseUrl, gridLayout = it.gridLayout, themeMode = it.themeMode) }
+        _state.update { AppState(initialized = true, serverUrl = repo.api.baseUrl, gridLayout = it.gridLayout, quickNote = it.quickNote, themeMode = it.themeMode) }
     }
 
     // =====================================================================
@@ -671,13 +678,25 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
 
     fun editorAction(block: (Int) -> Unit) = editorNoteIdOrCreate(block)
 
+    private val patchLock = Mutex()
+    private val patchVersion = HashMap<Int, Int>()
+
     private fun patch(ids: Collection<Int>, body: JsonObject, local: (NoteData) -> NoteData) {
         _state.update { s -> s.copy(notes = s.notes.mapValues { (k, n) -> if (k in ids) local(n) else n }) }
+        val versions = ids.associateWith { id -> (patchVersion[id] ?: 0) + 1 }
+        patchVersion.putAll(versions)
         viewModelScope.launch {
-            for (id in ids) {
-                try { upsert(repo.patchNote(id, body)) } catch (e: Exception) {
-                    message(e.message ?: "Änderung fehlgeschlagen", important = true)
-                    fetchQuietly(id)
+            // Änderungen laufen strikt nacheinander; Antworten auf bereits überholte Änderungen werden verworfen,
+            // sonst würde z. B. "Archivieren" nach einem schnellen "Rückgängig" den lokalen Stand wieder überschreiben.
+            patchLock.withLock {
+                for (id in ids) {
+                    try {
+                        val fresh = repo.patchNote(id, body)
+                        if (patchVersion[id] == versions[id]) upsert(fresh)
+                    } catch (e: Exception) {
+                        message(e.message ?: "Änderung fehlgeschlagen", important = true)
+                        if (patchVersion[id] == versions[id]) fetchQuietly(id)
+                    }
                 }
             }
         }
@@ -811,7 +830,40 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun clearSelection() = _state.update { it.copy(selected = emptySet()) }
 
     // ----------------------------------------------------------------- Ansicht & Suche
-    fun setView(view: ViewKey) = _state.update { it.copy(view = view, selected = emptySet(), searchActive = false, query = "", filter = null, searchIds = null) }
+    fun setView(view: ViewKey) {
+        _state.update { it.copy(view = view, selected = emptySet(), searchActive = false, query = "", filter = null, searchIds = null) }
+        // Archivnotizen liefert der Server ohne Inhalt – beim Öffnen der Ansicht sofort nachladen
+        if (view.kind == "archive") loadDeferredNotes()
+    }
+
+    private val deferredInFlight = HashSet<Int>()
+    private val deferredGate = Semaphore(4)
+
+    /** Lädt den Inhalt aller Notizen nach, die vom Server nur als Hülle (content_deferred) kamen. */
+    fun loadDeferredNotes() {
+        val uid = _state.value.user?.id ?: return
+        val ids = _state.value.notes.values.filter { it.contentDeferred && it.id !in deferredInFlight }.map { it.id }
+        if (ids.isEmpty()) return
+        deferredInFlight.addAll(ids)
+        for (id in ids) {
+            viewModelScope.launch {
+                try {
+                    deferredGate.withPermit {
+                        val full = repo.fetchNote(uid, id)
+                        upsert(full)
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    deferredInFlight.remove(id)
+                }
+            }
+        }
+    }
+
+    fun setQuickNote(enabled: Boolean) {
+        prefs.edit().putBoolean("quick_note", enabled).apply()
+        _state.update { it.copy(quickNote = enabled) }
+    }
 
     fun toggleLayout() {
         val grid = !_state.value.gridLayout
