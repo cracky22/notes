@@ -26,6 +26,13 @@ Native Android-App für den mitgelieferten FastAPI-Notizenserver. Die Oberfläch
 - Notizen haben keine feste Höhe mehr (versetztes Raster), Wischen nach links/rechts archiviert (bzw. holt aus dem Archiv), mit „Rückgängig“.
 - Haptisches Feedback bei Auswahl, Wischen, Aktualisieren, Anheften und Bedienelementen.
 
+## 2.2.1
+
+- „Rückgängig“ nach dem Archivieren: Änderungen laufen jetzt strikt nacheinander, veraltete Server-Antworten überschreiben den lokalen Stand nicht mehr.
+- Archivnotizen werden beim Öffnen des Archivs automatisch mit Inhalt nachgeladen.
+- Menü: Archiv, Papierkorb und Einstellungen stehen immer unten, nur die Labels scrollen.
+- Einstellung „Plus-Button legt direkt leere Notiz an“: Tippen = leere Notiz, langes Drücken = Menü (Bild, Liste, Notiz).
+
 ## Bauen
 
 1. JDK 17, Android SDK 35 und Android Studio mit Android Gradle Plugin 8.7.3 verwenden.
